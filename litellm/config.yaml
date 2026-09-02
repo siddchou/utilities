@@ -1,0 +1,10 @@
+model_list:
+  - model_name: claude-3-5-sonnet-local
+    litellm_params:
+      model: openai/qwen3.8-27b@q8_k_xl
+      api_base: http://127.0.0.1:1234/v1
+      api_key: "sk-unsloth-731f26acb13ff752828aac514fb6f812"
+      drop_params: true
+
+litellm_settings:
+  modify_params: true

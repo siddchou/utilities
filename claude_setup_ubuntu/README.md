@@ -2,16 +2,20 @@
 
 Runs [Claude Code](https://claude.com/claude-code) against a locally served model
 (LM Studio, Bionic, llama.cpp, vLLM — anything with an OpenAI-compatible API).
-
 ```
 Claude Code -> normalizer (:4001) -> LiteLLM (:4000) -> your model server (e.g. :1234)
 ```
 
 - **LiteLLM** translates Anthropic's Messages API to OpenAI chat completions
-  (streaming + tool calls both directions).
+  (streaming + tool calls both directions). It binds to `127.0.0.1` only, and
+  `drop_params: true` is set so unsupported client params are dropped instead of
+  failing the request.
 - **claude-bionic-normalizer.py** merges Claude Code's mid-conversation system
   messages into a single leading system message, which Qwen-family chat
-  templates require ("System message must be at the beginning").
+  templates require ("System message must be at the beginning"). It also
+  sanitizes tool `input_schema`s (strips `$schema`/`propertyNames`, merges
+  string-only `anyOf` unions) and drops Anthropic extended-thinking params, so
+  clients like Claude Desktop's Cowork mode work against strict local servers.
 
 ## Install
 
@@ -43,6 +47,45 @@ claude-local                  # interactive, default 256k context window
 claude-local 135k             # ...with a 135k context window (k = x1024)
 claude-local -p "your prompt" # one-shot / headless
 ```
+
+## Use with Claude Desktop (optional)
+
+Claude Desktop has an undocumented "enterprise gateway" (3P) mode that routes all
+inference through a custom Anthropic-compatible endpoint. Point it at the
+normalizer to chat with your local model in the desktop app:
+
+1. Add an alias for the model id Desktop requests to `~/.config/litellm/config.yaml`,
+   then restart the bridge (`systemctl --user restart litellm-bionic`):
+   ```yaml
+     - model_name: claude-sonnet-4-5
+       litellm_params:
+         model: openai/<MODEL_ID>
+         api_base: <API_BASE>
+         api_key: local-bridge
+   ```
+2. Create/merge `~/.config/Claude-3p/claude_desktop_config.json`:
+   ```json
+   { "deploymentMode": "3p" }
+   ```
+3. Create `~/.config/Claude-3p/configLibrary/<uuid>.json` (any uuid):
+   ```json
+   {
+     "inferenceProvider": "gateway",
+     "inferenceCredentialKind": "static",
+     "inferenceGatewayApiKey": "local-bridge",
+     "inferenceGatewayAuthScheme": "bearer",
+     "inferenceGatewayBaseUrl": "http://localhost:4001/",
+     "inferenceModels": [ { "name": "claude-sonnet-4-5", "labelOverride": "claude-sonnet-4-5" } ]
+   }
+   ```
+4. Register it in `~/.config/Claude-3p/configLibrary/_meta.json`: set `"appliedId"` to the
+   uuid and add `{ "id": "<uuid>", "name": "claude-sonnet-4-5" }` to `entries`.
+5. Fully quit Claude Desktop (tray → Quit) and relaunch; pick `claude-sonnet-4-5` —
+   that's your local model answering through the bridge chain.
+
+Revert by removing `"deploymentMode": "3p"` and deleting the configLibrary entry.
+The mode is undocumented (see https://github.com/mohitsoni48/Claude-Desktop-Router);
+a future app update may change or remove it.
 
 ## Manage
 

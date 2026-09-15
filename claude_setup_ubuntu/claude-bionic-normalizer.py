@@ -43,12 +43,68 @@ def _system_text(content) -> str:
     return ""
 
 
+def _clean_schema(node):
+    """Recursively strip JSON-Schema features local model servers reject.
+
+    Claude Desktop (Cowork mode) sends input_schemas containing ``$schema``
+    keys, string-only ``anyOf`` unions with ``const`` branches, and
+    ``propertyNames``. llama.cpp-based servers (LM Studio) validate tool
+    schemas strictly and answer 400 "Invalid input" for tools.0.
+    """
+    if isinstance(node, list):
+        return [_clean_schema(x) for x in node]
+    if not isinstance(node, dict):
+        return node
+    branches = node.get("anyOf")
+    if (
+        isinstance(branches, list)
+        and branches
+        and all(isinstance(b, dict) and b.get("type") == "string" for b in branches)
+    ):
+        # Merge a string-only anyOf into one enum schema.
+        enums = []
+        for b in branches:
+            if isinstance(b.get("enum"), list):
+                enums.extend(b["enum"])
+            elif "const" in b:
+                enums.append(b["const"])
+        merged = {k: _clean_schema(v) for k, v in node.items() if k != "anyOf"}
+        merged["type"] = "string"
+        if enums:
+            seen = set()
+            merged["enum"] = [e for e in enums if not (e in seen or seen.add(e))]
+        return merged
+    out = {}
+    for key, value in node.items():
+        if key in ("$schema", "propertyNames"):
+            continue
+        out[key] = _clean_schema(value)
+    return out
+
+
 def normalize(body: bytes) -> bytes:
-    """Merge mid-conversation system messages into a single leading system."""
+    """Merge mid-conversation system messages into a single leading system,
+    sanitize tool schemas for local servers, and drop extended thinking."""
     data = json.loads(body)
+
+    # Local OpenAI-compatible servers cannot do Anthropic extended thinking;
+    # LiteLLM would translate it to reasoning_effort which openai/ models
+    # reject. Drop it so requests go through on every API path.
+    if "thinking" in data:
+        data.pop("thinking")
+
+    tools = data.get("tools")
+    if isinstance(tools, list):
+        clean_tools = []
+        for tool in tools:
+            if isinstance(tool, dict) and isinstance(tool.get("input_schema"), (dict, list)):
+                tool = {**tool, "input_schema": _clean_schema(tool["input_schema"])}
+            clean_tools.append(tool)
+        data["tools"] = clean_tools
+
     messages = data.get("messages")
     if not isinstance(messages, list):
-        return body
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
     extra_systems = []
     kept_messages = []
@@ -63,12 +119,9 @@ def normalize(body: bytes) -> bytes:
     top_system = _system_text(data.get("system"))
     merged = [t for t in [top_system, *extra_systems] if t]
 
-    # Nothing to do: no system content anywhere.
-    if not merged and not extra_systems:
-        return body
-
     data["messages"] = kept_messages
-    data["system"] = "\n\n".join(merged)
+    if merged:
+        data["system"] = "\n\n".join(merged)
     return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 

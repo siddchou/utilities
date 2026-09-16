@@ -25,8 +25,9 @@ Claude Code -> normalizer (:4001) -> LiteLLM (:4000) -> your model server (e.g. 
 
 No sudo required. Installs Claude Code (native installer) and LiteLLM (pip, user
 site), writes config/wrapper/systemd units under `~/.config` and `~/.local/bin`,
-and enables two systemd user services (`litellm-bionic`, `claude-normalizer`)
-that auto-start at login.
+and installs two systemd user services (`litellm-bionic`, `claude-normalizer`).
+If Claude Desktop is installed the bridges run on demand with it (see below);
+otherwise they auto-start at login.
 
 ## Configure a different model / server
 
@@ -87,12 +88,34 @@ Revert by removing `"deploymentMode": "3p"` and deleting the configLibrary entry
 The mode is undocumented (see https://github.com/mohitsoni48/Claude-Desktop-Router);
 a future app update may change or remove it.
 
+### Bridge auto-starts with Claude Desktop
+
+When `claude-desktop` is installed, re-running the setup script switches the bridges
+from login auto-start to on demand: they start when Claude Desktop launches and stop
+again when the last instance exits. This installs:
+
+- `~/.local/bin/claude-desktop-local` — wrapper that starts the two user services
+  (systemd, or a nohup fallback), waits for health on :4000/:4001, then runs
+  `/usr/bin/claude-desktop`; on exit it stops the services unless another desktop
+  instance is still running. Log: `~/claude-desktop-local.log`.
+- `~/.local/bin/claude-desktop` — symlink to the wrapper, so terminal launches go
+  through it too (`~/.local/bin` is first on PATH).
+- `~/.local/share/applications/com.anthropic.Claude.desktop` — user-level override of
+  the system menu entry (same name wins), pointing at the wrapper.
+
+Revert: delete those three files and run
+`systemctl --user enable litellm-bionic claude-normalizer`.
+
 ## Manage
 
 ```bash
 ./setup-claude-local.sh --remove                          # uninstall generated files + services
 systemctl --user status litellm-bionic claude-normalizer  # health
 journalctl --user -u litellm-bionic -f                    # logs (or ~/litellm-bionic.log)
+tail -f ~/claude-desktop-local.log                        # Claude Desktop launch wrapper log
 ```
 
 Note: your model server must be running and serving the configured model.
+
+Re-running this setup script reinstalls the fixed normalizer (the embedded heredoc matches
+the standalone file).

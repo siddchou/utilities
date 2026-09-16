@@ -59,7 +59,14 @@ if [ "$REMOVE" -eq 1 ]; then
   rm -f "$CFG_DIR/config.yaml" \
         "$CFG_DIR/claude-bionic-normalizer.py" \
         "$BIN_DIR/claude-local"
-  echo "Removed: $CFG_DIR/{config.yaml,claude-bionic-normalizer.py}, $BIN_DIR/claude-local, systemd units."
+  # Claude Desktop launch integration (only remove our own symlink)
+  if [ -L "$BIN_DIR/claude-desktop" ] && [ "$(readlink "$BIN_DIR/claude-desktop")" = "claude-desktop-local" ]; then
+    rm -f "$BIN_DIR/claude-desktop"
+  fi
+  rm -f "$BIN_DIR/claude-desktop-local" \
+        "$HOME/.local/share/applications/com.anthropic.Claude.desktop"
+  echo "Removed: $CFG_DIR/{config.yaml,claude-bionic-normalizer.py}, $BIN_DIR/claude-local,"
+  echo "         Claude Desktop launch integration (wrapper + menu override), systemd units."
   echo "(Claude Code itself and LiteLLM packages were left in place.)"
   exit 0
 fi
@@ -458,10 +465,163 @@ RestartSec=2
 WantedBy=default.target
 EOF
   systemctl --user daemon-reload
-  systemctl --user enable --now litellm-bionic claude-normalizer
-  # restart so any previously running instances pick up the new config
-  systemctl --user restart litellm-bionic claude-normalizer || true
-  echo "Services enabled (auto-start at login) and started."
+
+  if command -v claude-desktop >/dev/null 2>&1; then
+    # --- Claude Desktop launch integration ----------------------------------
+    # The local LLM stack starts when Claude Desktop launches (and stops when
+    # the last instance exits) instead of auto-starting at login.
+    DESKTOP_REAL=$(command -v claude-desktop)
+    cat > "$BIN_DIR/claude-desktop-local" <<'DESKWRAPPEOF'
+#!/usr/bin/env bash
+# =============================================================================
+# claude-desktop-local — launch Claude Desktop with the local LLM bridge.
+#
+# Ensures the LiteLLM bridge (:4000) and message normalizer (:4001) are running
+# BEFORE starting Claude Desktop, waits until they answer health checks, then
+# launches the real binary (/usr/bin/claude-desktop). When the last Claude
+# Desktop instance exits, the bridge services are stopped again — so the local
+# LLM stack only runs while you actually use Claude Desktop.
+#
+#   * systemd user session available -> systemctl --user start/stop
+#     (units: litellm-bionic.service, claude-normalizer.service)
+#   * no systemd (e.g. headless SSH)  -> nohup fallback processes
+#
+# Logs to ~/claude-desktop-local.log. All arguments are passed through to
+# Claude Desktop (URLs from the app menu / deep links included).
+# =============================================================================
+set -u
+
+LITELLM_PORT=4000
+NORMALIZER_PORT=4001
+DESKTOP_BIN="${CLAUDE_DESKTOP_BIN:-__DESKTOP_BIN__}"
+LOG="$HOME/claude-desktop-local.log"
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
+
+have_systemd=0
+if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+  have_systemd=1
+fi
+
+up() { curl -s --max-time 3 "$1" >/dev/null 2>&1; }
+
+wait_for() { # url seconds
+  for _ in $(seq 1 "$2"); do
+    sleep 1
+    up "$1" && return 0
+  done
+  return 1
+}
+
+# --- ensure the bridge is running --------------------------------------------
+if ! up "http://localhost:$LITELLM_PORT/health"; then
+  if [ "$have_systemd" -eq 1 ]; then
+    log "Starting LiteLLM bridge + normalizer (systemd user services)..."
+    systemctl --user start litellm-bionic claude-normalizer 2>>"$LOG" || true
+  else
+    log "No systemd user session — starting bridges via nohup fallback..."
+    LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=true \
+      nohup "$HOME/.local/bin/litellm" --config "$HOME/.config/litellm/config.yaml" \
+        --port "$LITELLM_PORT" --host 127.0.0.1 >> ~/litellm-bionic.log 2>&1 &
+    nohup /usr/bin/python3 "$HOME/.config/litellm/claude-bionic-normalizer.py" \
+      --port "$NORMALIZER_PORT" >> ~/claude-normalizer.log 2>&1 &
+  fi
+fi
+
+ok=1
+if ! up "http://localhost:$LITELLM_PORT/health"; then
+  wait_for "http://localhost:$LITELLM_PORT/health" 90 \
+    || { log "ERROR: LiteLLM bridge :$LITELLM_PORT did not come up (see ~/litellm-bionic.log or: journalctl --user -u litellm-bionic)"; ok=0; }
+fi
+if ! up "http://localhost:$NORMALIZER_PORT/healthz"; then
+  wait_for "http://localhost:$NORMALIZER_PORT/healthz" 20 \
+    || { log "ERROR: normalizer :$NORMALIZER_PORT did not come up (see ~/claude-normalizer.log or: journalctl --user -u claude-normalizer)"; ok=0; }
+fi
+if [ "$ok" -eq 1 ]; then
+  log "Bridge ready (:4000 + :4001). Launching Claude Desktop..."
+else
+  log "WARNING: bridge not fully up — launching Claude Desktop anyway (it will show connection errors until the bridges recover)."
+fi
+
+# --- launch desktop; stop the bridge when the last instance exits ------------
+"$DESKTOP_BIN" "$@" &
+child=$!
+
+cleanup() {
+  # Give Electron helper processes (zygote, gpu-process) up to ~5s to exit
+  # after the main process is gone.
+  for _ in 1 2 3 4 5; do
+    pgrep -x claude-desktop >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if pgrep -x claude-desktop >/dev/null 2>&1; then
+    log "Another Claude Desktop instance is still running — leaving bridge up."
+  else
+    log "Claude Desktop exited — stopping LiteLLM bridge + normalizer."
+    if [ "$have_systemd" -eq 1 ]; then
+      systemctl --user stop litellm-bionic claude-normalizer 2>>"$LOG" || true
+    fi
+  fi
+}
+
+trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; cleanup; exit 130' INT
+trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; cleanup; exit 143' TERM
+
+wait "$child"
+rc=$?
+cleanup
+exit $rc
+DESKWRAPPEOF
+    sed -i "s|__DESKTOP_BIN__|$DESKTOP_REAL|" "$BIN_DIR/claude-desktop-local"
+    chmod +x "$BIN_DIR/claude-desktop-local"
+    # Terminal launches go through the wrapper too (~/.local/bin is first on PATH).
+    ln -sfn claude-desktop-local "$BIN_DIR/claude-desktop"
+
+    DESKTOP_OVERRIDE="$HOME/.local/share/applications/com.anthropic.Claude.desktop"
+    mkdir -p "$(dirname "$DESKTOP_OVERRIDE")"
+    cat > "$DESKTOP_OVERRIDE" <<EOF
+[Desktop Entry]
+Name=Claude
+Comment=Desktop application for Claude.ai (starts local LLM bridge)
+GenericName=AI Assistant
+Keywords=AI;Chat;Assistant;Claude;Code;LLM;
+Exec=$BIN_DIR/claude-desktop-local %U
+Icon=claude-desktop
+Type=Application
+StartupNotify=true
+# Matches the Wayland app_id / X11 WM_CLASS Chromium derives from
+# package.json desktopName, so docks group windows under this entry.
+StartupWMClass=com.anthropic.Claude
+# second-instance just focuses mainWindow; suppress GNOME's default "New Window" item
+SingleMainWindow=true
+Categories=Utility;Development;
+MimeType=x-scheme-handler/claude;
+Actions=NewChat;NewCode;
+
+[Desktop Action NewChat]
+Name=New Chat
+Exec=$BIN_DIR/claude-desktop-local "claude://claude.ai/new?surface=chat&source=desktop_action"
+
+[Desktop Action NewCode]
+Name=New Claude Code Session
+Exec=$BIN_DIR/claude-desktop-local "claude://code/new?source=desktop_action"
+EOF
+    echo "Wrote $DESKTOP_OVERRIDE (app menu now launches via the bridge wrapper)"
+
+    systemctl --user disable litellm-bionic claude-normalizer 2>/dev/null || true
+    systemctl --user start litellm-bionic claude-normalizer
+    # restart so any previously running instances pick up the new config
+    systemctl --user restart litellm-bionic claude-normalizer || true
+    echo "Services run on demand: they start when Claude Desktop launches"
+    echo "(wrapper: $BIN_DIR/claude-desktop-local) and stop when it exits."
+    echo "Re-enable login auto-start with:"
+    echo "  systemctl --user enable litellm-bionic claude-normalizer"
+  else
+    systemctl --user enable --now litellm-bionic claude-normalizer
+    # restart so any previously running instances pick up the new config
+    systemctl --user restart litellm-bionic claude-normalizer || true
+    echo "Services enabled (auto-start at login) and started."
+  fi
 else
   echo "systemd user session not available - skipping services."
   echo "claude-local will auto-start the bridges on demand instead."

@@ -57,10 +57,13 @@ TIMEOUT=25
     echo "=== $(date -Is) lms unload (shutdown hook) ==="
     if [[ ! -x $LMS_BIN ]]; then
         echo "lms not found at $LMS_BIN — skipping."
+    elif ! timeout -k 2 5 runuser -u "$LMS_USER" -- env HOME="$HOME_DIR" \
+            "$LMS_BIN" ps >/dev/null 2>&1; then
+        echo "LM Studio server is not running (or unresponsive) — nothing to unload."
     else
-        # Run as the LM Studio user so its config/auth is used.
+        # Server is up. Run as the LM Studio user so its config/auth is used.
         rc=0
-        timeout "$TIMEOUT" runuser -u "$LMS_USER" -- env HOME="$HOME_DIR" \
+        timeout -k 3 "$TIMEOUT" runuser -u "$LMS_USER" -- env HOME="$HOME_DIR" \
             "$LMS_BIN" unload --all || rc=$?
         if [[ $rc -eq 0 ]]; then
             echo "unload OK — sleeping 5s so GPU memory is fully released before driver teardown."
@@ -68,7 +71,7 @@ TIMEOUT=25
         elif [[ $rc -eq 124 ]]; then
             echo "WARN: lms unload timed out after ${TIMEOUT}s"
         else
-            echo "lms unload exited $rc (LM Studio server probably not running — fine)."
+            echo "lms unload failed (exit $rc) — server was up but refused the request."
         fi
     fi
 } >> "$LOG" 2>&1

@@ -1,0 +1,11 @@
+[Unit]
+Description=NVIDIA GPU power limiter (apply per-GPU power limit at boot)
+Documentation=https://github.com/siddchou/utilities/tree/main/nvidia_limit
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nvidia_limit.sh 275 15
+
+[Install]
+WantedBy=multi-user.target

@@ -278,23 +278,39 @@ fi
 if [ "${SKIP_IDEA:-0}" != 1 ]; then
   # folder name is build-based (e.g. idea-IU-262.10968.63) — detect dynamically
   IDEA_DIR="$(ls -d "$HOME"/opt/idea-IU-* | head -1)"
-  [ -x "$IDEA_DIR/bin/idea.sh" ] || die "IDEA extraction failed (no bin/idea.sh in $IDEA_DIR)"
+  [ -x "$IDEA_DIR/bin/idea" ] || die "IDEA extraction failed (no bin/idea in $IDEA_DIR)"
+  # use the NATIVE launcher (bin/idea, not idea.sh — avoids JetBrains'
+  # 'Consider switching to a native launcher' notification); values come
+  # from product-info.json so this stays correct across versions
+  read -r IDEA_LAUNCHER IDEA_WMCLASS < <(python3 - "$IDEA_DIR/product-info.json" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    launch = [l for l in d.get('launch', []) if l.get('os') == 'Linux'][0]
+    print(launch.get('launcherPath', 'bin/idea'), launch.get('startupWmClass', 'jetbrains-idea'))
+except Exception:
+    print('bin/idea jetbrains-idea')
+PYEOF
+)
   cat > "$HOME/.local/bin/idea" <<EOF
 #!/bin/sh
-exec "$IDEA_DIR/bin/idea.sh" "\$@"
+exec "$IDEA_DIR/$IDEA_LAUNCHER" "\$@"
 EOF
   chmod +x "$HOME/.local/bin/idea"
   mkdir -p "$HOME/.local/share/applications"
+  # StartupWMClass lets the taskbar/dash match terminal-launched windows to this icon
   cat > "$HOME/.local/share/applications/intellij-idea-ultimate.desktop" <<EOF
 [Desktop Entry]
 Name=IntelliJ IDEA Ultimate
 Comment=IntelliJ IDEA Ultimate ${IDEA_VER}
 Exec=$HOME/.local/bin/idea %U
 Icon=${IDEA_DIR}/bin/idea.png
+StartupWMClass=${IDEA_WMCLASS}
 Terminal=false
 Type=Application
 Categories=Development;IDE;
 EOF
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$HOME/.local/share/applications" || true
   manifest_set idea "$IDEA_VER"
 fi
 

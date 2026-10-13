@@ -5,6 +5,7 @@ After=nvidia-persistenced.service
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/local/bin/nvidia_limit.sh 275 15
 
 [Install]

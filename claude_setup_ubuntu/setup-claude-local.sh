@@ -127,6 +127,16 @@ model_list:
       model: openai/$MODEL_ID
       api_base: $API_BASE
       api_key: local-bridge
+  # Alias for Claude Desktop's 3p gateway mode (name must exist in the app's model catalog; claude-sonnet-4-6 is on all surfaces of seed v1935).
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/$MODEL_ID
+      api_base: $API_BASE
+      api_key: local-bridge
+general_settings:
+  # LiteLLM >= ~1.74 refuses to boot without a master key (loopback-only proxy;
+  # every client in this chain sends 'local-bridge' as its API key).
+  master_key: local-bridge
 litellm_settings:
   drop_params: true
 EOF

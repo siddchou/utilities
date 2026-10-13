@@ -29,6 +29,14 @@ and installs two systemd user services (`litellm-bionic`, `claude-normalizer`).
 If Claude Desktop is installed the bridges run on demand with it (see below);
 otherwise they auto-start at login.
 
+On Ubuntu 24.04+ where `python3 -m pip` is missing (ensurepip is stripped),
+bootstrap user-site pip first — no sudo needed:
+
+```bash
+curl https://bootstrap.pypa.io/get-pip.py | python3 - --user --break-system-packages
+```
+(or install system pip with `sudo apt install -y python3-pip`).
+
 ## Configure a different model / server
 
 ```bash
@@ -53,17 +61,26 @@ claude-local -p "your prompt" # one-shot / headless
 
 Claude Desktop has an undocumented "enterprise gateway" (3P) mode that routes all
 inference through a custom Anthropic-compatible endpoint. Point it at the
-normalizer to chat with your local model in the desktop app:
+normalizer to chat with your local model in the desktop app.
 
-1. Add an alias for the model id Desktop requests to `~/.config/litellm/config.yaml`,
-   then restart the bridge (`systemctl --user restart litellm-bionic`):
+**Model name gotcha:** the name used in step 3 must exist in the app's *bundled*
+model catalog, or ConfigHealth rejects it (`state: 'config_model_rejected'` in
+`~/.config/Claude-3p/logs/main.log`). On app 2.31226.1 (seed catalog v1935) use
+`claude-sonnet-4-6`. To see what your version accepts, decode the base64
+`documentBytes` field of `~/.config/Claude-3p/model-catalog/published.json`
+and look under `surfaces.*.model_selector_config[].models[].id`.
+
+1. The setup script already writes a `claude-sonnet-4-6` alias to
+   `~/.config/litellm/config.yaml` (re-run it after installing Desktop). If you use
+   a different catalog name, add an alias for it instead:
    ```yaml
-     - model_name: claude-sonnet-4-5
+     - model_name: claude-sonnet-4-6
        litellm_params:
          model: openai/<MODEL_ID>
          api_base: <API_BASE>
          api_key: local-bridge
    ```
+   then restart the bridge (`systemctl --user restart litellm-bionic`).
 2. Create/merge `~/.config/Claude-3p/claude_desktop_config.json`:
    ```json
    { "deploymentMode": "3p" }
@@ -76,12 +93,12 @@ normalizer to chat with your local model in the desktop app:
      "inferenceGatewayApiKey": "local-bridge",
      "inferenceGatewayAuthScheme": "bearer",
      "inferenceGatewayBaseUrl": "http://localhost:4001/",
-     "inferenceModels": [ { "name": "claude-sonnet-4-5", "labelOverride": "claude-sonnet-4-5" } ]
+     "inferenceModels": [ { "name": "claude-sonnet-4-6", "labelOverride": "claude-sonnet-4-6" } ]
    }
    ```
 4. Register it in `~/.config/Claude-3p/configLibrary/_meta.json`: set `"appliedId"` to the
-   uuid and add `{ "id": "<uuid>", "name": "claude-sonnet-4-5" }` to `entries`.
-5. Fully quit Claude Desktop (tray → Quit) and relaunch; pick `claude-sonnet-4-5` —
+   uuid and add `{ "id": "<uuid>", "name": "claude-sonnet-4-6" }` to `entries`.
+5. Fully quit Claude Desktop (tray → Quit) and relaunch; pick `claude-sonnet-4-6` —
    that's your local model answering through the bridge chain.
 
 Revert by removing `"deploymentMode": "3p"` and deleting the configLibrary entry.
@@ -114,6 +131,18 @@ systemctl --user status litellm-bionic claude-normalizer  # health
 journalctl --user -u litellm-bionic -f                    # logs (or ~/litellm-bionic.log)
 tail -f ~/claude-desktop-local.log                        # Claude Desktop launch wrapper log
 ```
+
+## Troubleshooting
+
+- **LiteLLM refuses to start** ("no master key is set"): LiteLLM >= ~1.7x enforces a
+  boot-time master-key check; the setup script writes `general_settings.master_key:
+  local-bridge` for this (the proxy binds to loopback only and every client in this
+  chain sends that key). Keep it if you hand-edit config.yaml.
+- **Desktop shows connection errors or no model**: look for
+  `[custom-3p] ConfigHealth ... state:` lines in `~/.config/Claude-3p/logs/main.log` —
+  `config_model_rejected` means the configLibrary name isn't in the app's bundled
+  catalog (see "Model name gotcha" above). Bridge health:
+  `systemctl --user status litellm-bionic claude-normalizer`.
 
 Note: your model server must be running and serving the configured model.
 

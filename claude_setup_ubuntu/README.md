@@ -134,6 +134,14 @@ tail -f ~/claude-desktop-local.log                        # Claude Desktop launc
 
 ## Troubleshooting
 
+- **Desktop: "Model discovery — Gateway /v1/models returned an unexpected body"**:
+  Desktop's 3p gateway calls `GET /v1/models` and expects the **Anthropic** model-list
+  shape (`data[].type == "model"`, `display_name`, `first_id`/`last_id`). Forwarding
+  LiteLLM's OpenAI-style body there (HTTP 200, wrong schema) trips this error. The
+  normalizer now answers `/v1/models` itself from its `MODEL_CATALOG`; keep those ids
+  in sync with the litellm aliases (the script writes both `claude-sonnet-4-5` and
+  `claude-sonnet-4-6`). Pinning `inferenceModels` + `inferenceGatewayAuthScheme` in
+  the configLibrary entry (step 2 above) also removes the app's reliance on discovery.
 - **LiteLLM refuses to start** ("no master key is set"): LiteLLM >= ~1.7x enforces a
   boot-time master-key check; the setup script writes `general_settings.master_key:
   local-bridge` for this (the proxy binds to loopback only and every client in this

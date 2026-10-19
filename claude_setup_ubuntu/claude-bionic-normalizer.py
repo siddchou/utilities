@@ -43,6 +43,36 @@ def _system_text(content) -> str:
     return ""
 
 
+# Served for GET /v1/models in Claude Desktop's 3p gateway mode: the app
+# expects an Anthropic-shaped model list (data[].type == "model",
+# display_name, first_id/last_id), not LiteLLM's OpenAI-style body. Ids must
+# match litellm model_name aliases AND exist in the app's bundled catalog.
+MODEL_CATALOG = [
+    ("claude-sonnet-4-5", "Claude Sonnet 4.5 (local)"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (local)"),
+]
+
+
+def model_list_body() -> bytes:
+    ids = [mid for mid, _ in MODEL_CATALOG]
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "type": "model",
+                    "id": mid,
+                    "display_name": name,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+                for mid, name in MODEL_CATALOG
+            ],
+            "has_more": False,
+            "first_id": ids[0],
+            "last_id": ids[-1],
+        }
+    ).encode("utf-8")
+
+
 def _clean_schema(node):
     """Recursively strip JSON-Schema features local model servers reject.
 
@@ -200,6 +230,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/healthz", "/health"):
             payload = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path.split("?", 1)[0] == "/v1/models":
+            payload = model_list_body()
             self.send_response(200)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(payload)))

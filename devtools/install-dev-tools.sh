@@ -113,6 +113,9 @@ latest_gh() {     # prints: <version> e.g. 2.102.0 (from GitHub releases API)
 
 # ------------------------------------------------------------- PATH / bashrc --
 update_bashrc() {
+  # The managed block goes at the TOP of ~/.bashrc - before Ubuntu's
+  # "non-interactive shells return early" guard (case $- in *i*) ... esac) -
+  # so JAVA_HOME/PATH also work in non-interactive login shells (ssh, etc.).
   python3 - <<'PYEOF'
 import os, re
 path = os.path.expanduser('~/.bashrc')
@@ -121,14 +124,11 @@ export JAVA_HOME="$HOME/opt/jdk-27"
 export PATH="$JAVA_HOME/bin:$HOME/flutter/bin:$PATH"
 # <<< dev-tools-managed <<<'''
 content = open(path).read() if os.path.exists(path) else ''
-pat = re.compile(r'# >>> dev-tools-managed >>>.*?# <<< dev-tools-managed <<</', re.S)
-if pat.search(content):
-    content = pat.sub(block, content)
-else:
-    if content and not content.endswith('\n'):
-        content += '\n'
-    content += block + '\n'
-open(path, 'w').write(content)
+pat = re.compile(r'\n?# >>> dev-tools-managed >>>.*?# <<< dev-tools-managed <<<\n?', re.S)
+content = pat.sub('', content)   # drop any existing block (incl. legacy EOF placement)
+if content and not content.endswith('\n'):
+    content += '\n'
+open(path, 'w').write(block + '\n\n' + content if content else block + '\n')
 PYEOF
 }
 
@@ -238,8 +238,12 @@ curl -fsSL --max-time 30 -o "$WORK/jdk.sha256" \
   "https://download.oracle.com/java/${JDK_VERSION}/latest/jdk-${JDK_VERSION}_linux-${JDK_ARCH}_bin.tar.gz.sha256"
 ( cd "$WORK" && echo "$(awk '{print $1}' jdk.sha256)  jdk.tar.gz" | sha256sum -c - ) \
   || die "Oracle JDK checksum mismatch!"
-mkdir -p "$HOME/opt"; rm -rf "$HOME/opt/jdk-${JDK_VERSION}"
-tar -xzf "$WORK/jdk.tar.gz" -C "$HOME/opt/"
+rm -rf "$HOME/opt/jdk-${JDK_VERSION}"
+mkdir -p "$WORK/jdk-x"; tar -xzf "$WORK/jdk.tar.gz" -C "$WORK/jdk-x"
+# Oracle's top-level dir is versioned (e.g. jdk-27.0.1) — normalize to the canonical name
+JDK_DIR="$(find "$WORK/jdk-x" -mindepth 1 -maxdepth 1 -type d | head -1)"
+[ -n "$JDK_DIR" ] && [ -x "$JDK_DIR/bin/java" ] || die "JDK tarball layout unexpected (no bin/java under $WORK/jdk-x)"
+mkdir -p "$HOME/opt"; mv "$JDK_DIR" "$HOME/opt/jdk-${JDK_VERSION}"
 fi
 [ "${SKIP_JDK:-0}" != 1 ] && manifest_set jdk "$JDK_VERSION" || true
 

@@ -15,6 +15,7 @@ For every detected GPU this utility will:
 |---|---|
 | `nvidia_limit.sh` | Linux power limiter (the core script) |
 | `install.sh` | Installs the script + systemd unit, enables it at boot, verifies |
+| `update_nvidia_driver.sh` | Updates the apt-managed NVIDIA driver to the newest branch in your repos |
 | `nvidia-limit.service` | Reference systemd unit (the installer generates its own with your wattage baked in) |
 | `nvidia_limit.bat` | Windows equivalent — run as administrator |
 
@@ -46,6 +47,17 @@ systemctl status nvidia-limit              # "active (exited)" = ran successfull
 sudo systemctl disable --now nvidia-limit  # stop applying the limit at boot
 nvidia-smi -q -d POWER                     # inspect current limits per GPU
 ```
+
+### Update the NVIDIA driver
+
+```bash
+./update_nvidia_driver.sh            # update to the newest branch in your repos
+./update_nvidia_driver.sh --check    # report current vs available, install nothing
+./update_nvidia_driver.sh 615        # pin a specific branch (also used for downgrades)
+```
+
+- Works with apt-managed drivers (`nvidia-driver-*` packages); the open/proprietary kernel flavor of your current install is preserved.
+- Re-execs itself with `sudo`. A reboot is required after an update so the new kernel module loads; verify afterwards with `nvidia-smi --query-gpu=name,driver_version --format=csv,noheader`.
 
 ## Windows
 

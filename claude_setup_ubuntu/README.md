@@ -6,6 +6,11 @@ Runs [Claude Code](https://claude.com/claude-code) against a locally served mode
 Claude Code -> normalizer (:4001) -> LiteLLM (:4000) -> your model server (e.g. :1234)
 ```
 
+> **Running a Strata server instead?** Use
+> [`../claude_setup_strata`](../claude_setup_strata). Strata speaks the
+> Anthropic Messages API natively, so it needs neither LiteLLM nor the
+> system-message normalizer described below.
+
 - **LiteLLM** translates Anthropic's Messages API to OpenAI chat completions
   (streaming + tool calls both directions). It binds to `127.0.0.1` only, and
   `drop_params: true` is set so unsupported client params are dropped instead of

@@ -424,8 +424,23 @@ EOF
   fi
 
   # Launcher: bring the shim up before Desktop, stop it when the last window exits.
-  DESKTOP_REAL=$(command -v claude-desktop || true)
+  # Resolve the REAL Claude Desktop binary. Never accept ~/.local/bin/claude-desktop:
+  # that is our own symlink to this wrapper, and launching it recurses forever.
+  SELF_RESOLVED=$(readlink -f "$BIN_DIR/claude-desktop-strata" 2>/dev/null \
+                  || printf '%s' "$BIN_DIR/claude-desktop-strata")
+  DESKTOP_REAL=""
+  for cand in /usr/bin/claude-desktop /usr/lib/claude-desktop/claude-desktop \
+              "$(command -v claude-desktop 2>/dev/null || true)"; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    case "$cand" in "$BIN_DIR"/*|*claude-desktop-strata) continue ;; esac
+    res=$(readlink -f "$cand" 2>/dev/null || printf '%s' "$cand")
+    [ "$res" = "$SELF_RESOLVED" ] && continue
+    DESKTOP_REAL="$cand"
+    break
+  done
   [ -n "$DESKTOP_REAL" ] || DESKTOP_REAL="/usr/bin/claude-desktop"
+  echo "Launcher target: $DESKTOP_REAL"
+
   cat > "$BIN_DIR/claude-desktop-strata" <<'DESKWRAPPEOF'
 #!/usr/bin/env bash
 # Launch Claude Desktop with the Strata shim (:4001) running behind it.
@@ -437,10 +452,41 @@ SHIM_PORT=__SHIM_PORT__
 SHIM_UPSTREAM="__SHIM_UPSTREAM__"
 DESKTOP_MODELS="__DESKTOP_MODELS__"
 SHIM_THINKING="__THINKING__"
+SHIM_SERVICE=claude-strata-shim
 DESKTOP_BIN="${CLAUDE_DESKTOP_BIN:-__DESKTOP_BIN__}"
 LOG="$HOME/claude-desktop-strata.log"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
+
+# Never let a repeated failure grow the log without bound.
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+  : > "$LOG"
+fi
+
+# --- never launch ourselves ---------------------------------------------------
+# A past build resolved DESKTOP_BIN to ~/.local/bin/claude-desktop, a symlink
+# back to this script: every level re-launched the wrapper, forking forever and
+# stopping the shim as each level unwound. Repair the target, then refuse it.
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+resolve() { readlink -f "$1" 2>/dev/null || printf '%s' "$1"; }
+if [ "$(resolve "$DESKTOP_BIN")" = "$SELF" ]; then
+  for cand in /usr/bin/claude-desktop /usr/lib/claude-desktop/claude-desktop; do
+    [ -x "$cand" ] || continue
+    [ "$(resolve "$cand")" = "$SELF" ] && continue
+    log "Repairing self-referencing target: $DESKTOP_BIN -> $cand"
+    DESKTOP_BIN="$cand"
+    break
+  done
+fi
+if [ "$(resolve "$DESKTOP_BIN")" = "$SELF" ]; then
+  log "ERROR: Claude Desktop binary not found (target would launch itself: $DESKTOP_BIN)."
+  log "       Install it with install-claude-desktop.sh, or export CLAUDE_DESKTOP_BIN=/path/to/claude-desktop."
+  exit 1
+fi
+if [ -n "${CLAUDE_DESKTOP_STRATA_ACTIVE:-}" ]; then
+  # Another instance already owns the shim lifecycle; just hand off.
+  exec "$DESKTOP_BIN" "$@"
+fi
 
 have_systemd=0
 if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
@@ -448,11 +494,24 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>
 fi
 up() { curl -s --max-time 3 "$1" >/dev/null 2>&1; }
 wait_for() { for _ in $(seq 1 "$2"); do sleep 1; up "$1" && return 0; done; return 1; }
+desktop_running() {
+  # Match the executable, not the command line: `pgrep -f` also hits shells or
+  # editors that merely mention the path, which used to keep the shim alive.
+  # Electron helpers share the same exe and comm, so they count as "running".
+  local target pid
+  target="$(resolve "$DESKTOP_BIN")"
+  for pid in $(pgrep -x "$(basename "$DESKTOP_BIN")" 2>/dev/null); do
+    [ "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" = "$target" ] && return 0
+  done
+  return 1
+}
 
+started_shim=0
 if ! up "http://localhost:$SHIM_PORT/healthz"; then
+  started_shim=1
   if [ "$have_systemd" -eq 1 ]; then
     log "Starting the Strata shim (systemd user service)..."
-    systemctl --user start claude-strata-shim 2>>"$LOG" || true
+    systemctl --user start "$SHIM_SERVICE" 2>>"$LOG" || true
   else
     log "No systemd user session - starting the shim via nohup..."
     nohup /usr/bin/python3 "$HOME/.config/claude-strata/claude-strata-shim.py" \
@@ -461,25 +520,29 @@ if ! up "http://localhost:$SHIM_PORT/healthz"; then
   fi
 fi
 if up "http://localhost:$SHIM_PORT/healthz"; then
-  log "Shim ready :$SHIM_PORT -> $SHIM_UPSTREAM. Launching Claude Desktop..."
+  log "Shim ready :$SHIM_PORT -> $SHIM_UPSTREAM. Launching Claude Desktop ($DESKTOP_BIN)..."
 elif wait_for "http://localhost:$SHIM_PORT/healthz" 20; then
-  log "Shim ready :$SHIM_PORT. Launching Claude Desktop..."
+  log "Shim ready :$SHIM_PORT. Launching Claude Desktop ($DESKTOP_BIN)..."
 else
+  started_shim=0
   log "WARNING: shim :$SHIM_PORT did not come up (see ~/claude-strata-shim.log) - launching anyway."
 fi
 
+export CLAUDE_DESKTOP_STRATA_ACTIVE=1
 "$DESKTOP_BIN" "$@" &
 child=$!
 cleanup() {
-  for _ in 1 2 3 4 5; do
-    pgrep -x claude-desktop >/dev/null 2>&1 || break
+  # Electron helpers (zygote, gpu-process) linger a few seconds after the main
+  # process, and a second instance keeps needing the shim: wait, then decide.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    desktop_running || break
     sleep 1
   done
-  if pgrep -x claude-desktop >/dev/null 2>&1; then
-    log "Another Claude Desktop instance is still running - leaving the shim up."
-  elif [ "$have_systemd" -eq 1 ]; then
+  if desktop_running; then
+    log "A Claude Desktop instance is still running - leaving the shim up."
+  elif [ "$started_shim" -eq 1 ] && [ "$have_systemd" -eq 1 ]; then
     log "Claude Desktop exited - stopping the shim."
-    systemctl --user stop claude-strata-shim 2>>"$LOG" || true
+    systemctl --user stop "$SHIM_SERVICE" 2>>"$LOG" || true
   fi
 }
 trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; cleanup; exit 130' INT

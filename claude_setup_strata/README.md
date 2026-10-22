@@ -189,6 +189,17 @@ strata connect claude-code --url http://127.0.0.1:47831 --check   # vendor's own
 - **`/v1/messages/count_tokens` 404s** — Strata has no such route. Harmless for
   Claude Code (it estimates); the shim answers it for Desktop so the app stops
   retrying.
+- **Clicking the Claude icon does nothing, and `~/claude-desktop-strata.log`
+  fills with thousands of identical "Launching Claude Desktop" lines** — the
+  launcher was pointing at itself. `~/.local/bin/claude-desktop` is a symlink to
+  the launcher, so a target resolved through `PATH` re-ran the wrapper forever,
+  and each unwinding level stopped the shim. Recover:
+  `pkill -f '^bash .*claude-desktop-strata'`, then re-run
+  `./setup-claude-strata.sh --desktop`. The wrapper now repairs or refuses a
+  self-referencing target and hands off on nested launches, so it cannot loop.
+  Check the target with `grep DESKTOP_BIN= ~/.local/bin/claude-desktop-strata`
+  (expect `/usr/bin/claude-desktop`); force it with
+  `CLAUDE_DESKTOP_BIN=/usr/bin/claude-desktop`.
 - **Desktop: first reply takes 10-40 s** — prefill, not the shim. Measured on
   this box: time-to-first-token 9 s at ~1.5K prompt tokens, 38 s at ~7K. A
   Cowork prompt with ~20 tools is at the top of that range; the shim's own

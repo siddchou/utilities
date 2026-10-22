@@ -243,6 +243,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # errors go to stderr, stdout stays quiet
         sys.stderr.write("[strata-shim] %s\n" % (fmt % args))
 
+    def handle(self):
+        # Desktop drops the connection whenever a turn is cancelled or times out.
+        # socketserver prints a whole traceback for that; it is routine traffic.
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError):
+            pass
+
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")

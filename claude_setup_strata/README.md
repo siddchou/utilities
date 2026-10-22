@@ -161,6 +161,9 @@ a future app update may change or remove it.
 ## Manage
 
 ```bash
+../update-claude-desktop.sh                                 # apt upgrade + re-verify this wiring
+../update-claude-desktop.sh --check                         # same checks, no root
+../update-claude-desktop.sh --verify                        # after relaunch: is 3p still healthy?
 ./setup-claude-strata.sh --remove                           # uninstall everything this script wrote
 systemctl --user status claude-strata-shim                  # shim health
 journalctl --user -u claude-strata-shim -f                  # shim logs
@@ -180,6 +183,19 @@ strata connect claude-code --url http://127.0.0.1:47831 --check   # vendor's own
   wrapper normally self-heals by reading that on each launch.
 - **`[claude-code:unrecognized_model]` on stderr** — harmless: Claude Code
   notices the id isn't an Anthropic one. Strata documents it too.
+- **Desktop: replies stop half-finished, and shell commands fail with
+  `apply-seccomp: write /proc/self/setgroups (nested userns is
+  capability-restricted; caller must provide CAP_SYS_ADMIN): Permission denied`**
+  — run `./setup-claude-strata.sh --fix-cowork-sandbox`. Claude Desktop already
+  runs its CLI inside a user namespace, and Claude Code's own bubblewrap sandbox
+  then tries to nest a second one, which Linux refuses without `CAP_SYS_ADMIN`.
+  Every Bash call exits 1 before running, the model retries, announces a next
+  step and ends the turn — so the message looks truncated even though the
+  transport is fine. `bwrap` alone works; `bwrap` inside `bwrap` does not, which
+  is how to tell this apart from a server problem. The fix disables the *inner*
+  sandbox in `~/.claude/settings.json`; Desktop still sandboxes the CLI itself.
+  If a future build pushes its own settings payload over that key, flip the
+  app's own sandbox/VM setting instead.
 - **Replies stop mid-sentence, `stop_reason: max_tokens`** — thinking tokens
   count against `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (4096). Raise it:
   `STRATA_MAX_OUTPUT_TOKENS=8192 claude-strata`.

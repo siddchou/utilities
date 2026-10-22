@@ -22,6 +22,9 @@
 #   ./setup-claude-strata.sh --test          # ...and run an end-to-end prompt
 #   ./setup-claude-strata.sh --write-settings # also write ~/.claude/settings.json
 #   ./setup-claude-strata.sh --desktop       # also wire Claude Desktop 3p via the shim
+#   ./setup-claude-strata.sh --fix-cowork-sandbox  # stop Claude Code's inner sandbox
+#                                          # nesting inside Desktop's (otherwise
+#                                          # every Bash tool call fails: seccomp)
 #   ./setup-claude-strata.sh --remove        # remove everything this script wrote
 #
 # Configuration (environment variables):
@@ -61,13 +64,15 @@ RUN_TEST=0
 REMOVE=0
 WITH_DESKTOP=0
 WRITE_SETTINGS=0
+FIX_SANDBOX=0
 for arg in "$@"; do
   case "$arg" in
     --test)           RUN_TEST=1 ;;
     --remove)         REMOVE=1 ;;
     --desktop)        WITH_DESKTOP=1 ;;
     --write-settings) WRITE_SETTINGS=1 ;;
-    *) echo "Unknown option: $arg (expected --test, --remove, --desktop or --write-settings)" >&2; exit 2 ;;
+    --fix-cowork-sandbox) FIX_SANDBOX=1 ;;
+    *) echo "Unknown option: $arg (expected --test, --remove, --desktop, --write-settings or --fix-cowork-sandbox)" >&2; exit 2 ;;
   esac
 done
 
@@ -138,6 +143,22 @@ if not env:
 json.dump(cfg, open(path, "w"), indent=2)
 print("cleaned %d key(s) from %s%s" % (len(removed), path,
       "" if removed else " (none of ours found; your own env left untouched)"))
+PY
+  fi
+
+  # Undo --fix-cowork-sandbox: drop the sandbox key only if it is exactly ours.
+  if [ -f "$SETTINGS_JSON" ]; then
+    python3 - "$SETTINGS_JSON" <<'PY' || true
+import json, sys
+path = sys.argv[1]
+try:
+    cfg = json.load(open(path))
+except Exception:
+    sys.exit(0)
+if isinstance(cfg, dict) and cfg.get("sandbox") == {"enabled": False}:
+    del cfg["sandbox"]
+    json.dump(cfg, open(path, "w"), indent=2)
+    print("restored sandbox default in", path)
 PY
   fi
 
@@ -394,6 +415,42 @@ PY
 else
   echo "Skipped ~/.claude/settings.json (pass --write-settings to make Strata the"
   echo "default for every 'claude' launch; the claude-strata wrapper needs neither)."
+fi
+
+if [ "$FIX_SANDBOX" -eq 1 ]; then
+  # Claude Desktop already runs the CLI inside a user namespace, so Claude Code's
+  # own bubblewrap sandbox cannot nest another one. The kernel refuses it and
+  # every Bash tool call dies before it runs:
+  #   apply-seccomp: write /proc/self/setgroups (nested userns is
+  #   capability-restricted; caller must provide CAP_SYS_ADMIN): Permission denied
+  # The model retries, then gives up and ends the turn - which looks like replies
+  # stopping half-finished. Drop the inner sandbox; Desktop's outer one stays.
+  mkdir -p "$(dirname "$SETTINGS_JSON")"
+  python3 - "$SETTINGS_JSON" <<'PY'
+import json, os, shutil, sys
+path = sys.argv[1]
+cfg = {}
+if os.path.exists(path):
+    try:
+        cfg = json.load(open(path))
+    except Exception:
+        shutil.copy2(path, path + ".bak")
+        print("existing %s is not valid JSON; backed up to %s.bak" % (path, path))
+        cfg = {}
+if not isinstance(cfg, dict):
+    cfg = {}
+sb = cfg.get("sandbox")
+if not isinstance(sb, dict):
+    sb = {}
+    cfg["sandbox"] = sb
+sb["enabled"] = False
+json.dump(cfg, open(path, "w"), indent=2)
+print("Wrote %s -> sandbox.enabled = false" % path)
+print("(Desktop still sandboxes the CLI itself, so commands are not running bare.)")
+PY
+else
+  echo "Skipped the Cowork sandbox fix (use --fix-cowork-sandbox if Desktop turns"
+  echo "shell commands into 'apply-seccomp: ... Permission denied')."
 fi
 
 if [ "$WITH_DESKTOP" -eq 1 ]; then

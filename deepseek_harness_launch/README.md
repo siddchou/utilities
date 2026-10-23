@@ -1,6 +1,6 @@
 # deepseek_harness_launch
 
-Double-click launchers for a DeepSeek Harness source checkout on Ubuntu/GNOME. One entry starts the Web UI in its own browser window — and stops it again (double-click while running, or just close that window) — plus an entry to rebuild the artifacts.
+Double-click launchers for a DeepSeek Harness source checkout on Ubuntu/GNOME. One entry opens the Web UI in its own browser window (starting the server if needed); closing that window stops the server. Plus an entry to rebuild the artifacts.
 
 The scripts run `dsh web` straight from your checkout's source (node + tsx), so no packaged app is needed. The checkout path is a setting (`DSH_REPO` in `launch.conf`), defaulting to `/home/schou08/Applications/deepseek-harness`.
 
@@ -8,8 +8,8 @@ The scripts run `dsh web` straight from your checkout's source (node + tsx), so 
 
 | File | Purpose |
 |---|---|
-| `dsh-web.sh` | Toggle entry: not running → starts `dsh web` and opens a dedicated, watchable browser window; already running → stops (closes the window + graceful shutdown) |
-| `dsh-stop.sh` | Stop script: graceful `SIGTERM`, then `SIGKILL` after 20s. Not a menu entry — run by the window watcher and from a terminal |
+| `dsh-web.sh` | Open entry: not running → starts `dsh web` and opens a dedicated, watchable browser window; already running → re-opens the UI in that same window |
+| `dsh-stop.sh` | Stop script: graceful `SIGTERM`, then `SIGKILL` after 20s. Not a menu entry — run by the window watcher when you close the UI window, or from a terminal |
 | `dsh-build.sh` | Build entry: `pnpm run build:artifacts`; `--full` (terminal only) runs the complete `pnpm run build` |
 | `install-desktop-entry.sh` | Links the two entries into `~/.local/share/applications`, removes any older Stop entry, and enables double-click launch in Files; `--uninstall` reverses it |
 | `dsh-common.sh` | Shared helpers: PATH/node discovery, artifact checks, port probe, notifications |
@@ -35,14 +35,15 @@ pnpm run build        # full; or double-click DeepSeek Harness (Build) for just 
 
 ## Usage
 
-- **DeepSeek Harness** — one entry, two states:
+- **DeepSeek Harness** — always opens the UI:
   - Not running → starts the server and opens a dedicated Chrome/Firefox window on `http://127.0.0.1:3080/?token=…`.
-  - Already running → stops it (closes the window, graceful shutdown).
-  - Closing that window also stops the server within a few seconds: a watcher runs the stop script when the browser process exits. The window uses its own profile under `~/.local/state/deepseek-harness-launcher/browser-profile`, so it is an independent process even while your normal browser session is open.
+  - Already running → if its window is open it just tells you to find it in your taskbar (no duplicate windows); otherwise it opens a fresh dedicated window.
+  - Closing that window stops the server within a few seconds: a watcher runs the stop script when the browser process exits. The window uses its own profile under `~/.local/state/deepseek-harness-launcher/browser-profile`, so it is an independent process even while your normal browser session is open.
+- To stop without closing the window (e.g., from another machine), run `dsh-stop.sh` in a terminal.
 - If some other server already listens on the port, the entry opens that URL and touches nothing.
 - Pick where the agent works with **Choose workspace** in the Web UI; the start directory is only a default location.
 - Model API key: **Settings → Models** in the Web UI, or `DEEPSEEK_API_KEY=…` in `~/.dsh/.env`.
-- After every `git pull`: double-click **DeepSeek Harness (Build)**, then toggle off and on again.
+- After every `git pull`: close the UI window, double-click **DeepSeek Harness (Build)**, then open it again.
 
 ## Why it starts from the repo root
 
@@ -68,6 +69,6 @@ A source launch runs node through tsx, which resolves the checkout's tsconfig `p
 | Files says the launcher is untrusted | Right-click the desktop file once → **Allow Launching**, or re-run the install script. |
 | Nothing opens after a long wait | `tail -40 ~/.local/state/deepseek-harness-launcher/web.log` |
 | Port already serving something | The entry opens that port and tells you. Stop the other server, or set `DSH_PORT` in `launch.conf`. |
-| Closed the window but the server keeps running | Auto-stop needs a trackable browser (Chrome-family/Firefox). Check the start notification; set `DSH_BROWSER` in `launch.conf`, or double-click the entry again to stop. |
+| Closed the window but the server keeps running | Auto-stop needs a trackable browser (Chrome-family/Firefox). Check the start notification; set `DSH_BROWSER` in `launch.conf`, or run `dsh-stop.sh` from a terminal. |
 | Browser shows 401 | Open the `dsh web: http://127.0.0.1:<port>/?token=…` line from `web.log`; the token is per server process. |
 | Moved or renamed this folder | The desktop files hold absolute paths; re-run the install script from the new location and delete stale entries. |

@@ -142,14 +142,10 @@ dsh_open_url() {
 # Kept across starts so the UI's cookie and localStorage survive restarts.
 dsh_browser_profile_dir=$dsh_state_dir/browser-profile
 
-# Launch $1 in a dedicated, watchable browser instance; records the pid of the
-# browser process in dsh_browser_pid_file. Honours DSH_BROWSER from launch.conf,
-# otherwise auto-detects a Chrome-family or Firefox binary.
-# @param $1 - absolute http(s) URL.
-# @returns 0 when a tracked window was launched, 1 when no trackable browser
-#   exists (the caller should fall back to dsh_open_url).
-dsh_launch_tracked_browser() {
-  local url=$1 bin='' candidate base
+# Resolve the browser for tracked windows: DSH_BROWSER from launch.conf, else
+# auto-detection (Chrome-family first, then Firefox). Prints "bin family".
+dsh_detect_browser() {
+  local bin='' candidate base
   if [ -n "${DSH_BROWSER:-}" ]; then
     bin=${DSH_BROWSER}
   else
@@ -163,12 +159,27 @@ dsh_launch_tracked_browser() {
   fi
   [ -n "$bin" ] && [ -x "$bin" ] || return 1
   base=$(basename -- "$bin")
+  if [ "${base#firefox}" != "$base" ]; then
+    printf '%s %s\n' "$bin" firefox
+  else
+    printf '%s %s\n' "$bin" chrome
+  fi
+}
+
+# Launch $1 in a dedicated, watchable browser instance; records the pid of the
+# browser process in dsh_browser_pid_file.
+# @param $1 - absolute http(s) URL.
+# @returns 0 when a tracked window was launched, 1 when no trackable browser
+#   exists (the caller should fall back to dsh_open_url).
+dsh_launch_tracked_browser() {
+  local url=$1 bin family
+  { read -r bin family; } < <(dsh_detect_browser) || return 1
   mkdir -p "$dsh_browser_profile_dir"
   chmod 700 "$dsh_browser_profile_dir"
   rm -f "$dsh_browser_pid_file"
   # The wrapper records its own pid before exec'ing the browser, so the pid
   # file holds the browser process itself regardless of setsid forking.
-  if [ "${base#firefox}" != "$base" ]; then
+  if [ "$family" = firefox ]; then
     setsid bash -c 'printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
       _ "$dsh_browser_pid_file" "$bin" --no-remote "--profile" "$dsh_browser_profile_dir" "$url" >/dev/null 2>&1 &
   else
@@ -184,21 +195,44 @@ dsh_launch_tracked_browser() {
   [ -s "$dsh_browser_pid_file" ]
 }
 
-# Watch the tracked browser window: when its process exits (the user closed the
-# window), stop the server gracefully — unless a toggle-stop already did.
+# Whether the dedicated UI window's browser process is still alive.
+dsh_tracked_browser_alive() {
+  local bpid
+  [ -f "$dsh_browser_pid_file" ] || return 1
+  bpid=$(cat "$dsh_browser_pid_file" 2>/dev/null) || return 1
+  case $bpid in ('' | *[!0-9]*) return 1 ;; esac
+  kill -0 "$bpid" 2>/dev/null
+}
+
+# Watcher body, run in its own session: wait for the watched browser process to
+# exit. If another dedicated-browser process for our profile is still alive (a
+# re-open attached to it instead of spawning a new instance), hand over watching
+# to it; only when no dedicated window remains, stop the server — unless it was
+# already stopped.
+dsh_window_watcher_loop() {
+  local watch_pid=$1 profile_dir=$2 web_pid_file=$3 stop_script=$4 next server_pid
+  while kill -0 "$watch_pid" 2>/dev/null; do sleep 3; done
+  next=$(pgrep -f -- "user-data-dir=${profile_dir}|--profile ${profile_dir}" | head -n1 || true)
+  if [ -n "$next" ] && kill -0 "$next" 2>/dev/null; then
+    dsh_window_watcher_loop "$next" "$profile_dir" "$web_pid_file" "$stop_script"
+    return $?
+  fi
+  [ -f "$web_pid_file" ] || return 0
+  server_pid=$(cat "$web_pid_file" 2>/dev/null) || return 0
+  case $server_pid in ("" | *[!0-9]*) return 0 ;; esac
+  kill -0 "$server_pid" 2>/dev/null || return 0
+  exec "$stop_script"
+}
+
+# Spawn the watcher for the tracked browser window recorded in
+# dsh_browser_pid_file.
 dsh_spawn_window_watcher() {
   local browser_pid
   browser_pid=$(cat "$dsh_browser_pid_file" 2>/dev/null) || return 0
   case $browser_pid in ('' | *[!0-9]*) return 0 ;; esac
-  setsid bash -c '
-    browser_pid=$1; web_pid_file=$2; stop_script=$3
-    while kill -0 "$browser_pid" 2>/dev/null; do sleep 3; done
-    [ -f "$web_pid_file" ] || exit 0
-    server_pid=$(cat "$web_pid_file" 2>/dev/null) || exit 0
-    case $server_pid in ("" | *[!0-9]*) exit 0 ;; esac
-    kill -0 "$server_pid" 2>/dev/null || exit 0
-    exec "$stop_script"
-  ' _ "$browser_pid" "$dsh_web_pid_file" "$dsh_launcher_dir/dsh-stop.sh" >/dev/null 2>&1 &
+  setsid bash -c 'source "$1"; dsh_window_watcher_loop "$2" "$3" "$4" "$5"' \
+    _ "$dsh_launcher_dir/dsh-common.sh" "$browser_pid" "$dsh_browser_profile_dir" \
+      "$dsh_web_pid_file" "$dsh_launcher_dir/dsh-stop.sh" >/dev/null 2>&1 &
 }
 
 # Close the tracked UI window, if one is open (used by every stop path).

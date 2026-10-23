@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Double-click or app-grid entry: start the DeepSeek Harness Web UI, or bring the
-# server that is already running back into the browser.
+# Double-click or app-grid entry: toggle the DeepSeek Harness Web UI.
+#
+# Not running  -> start `dsh web` and open a dedicated browser window; closing
+#                 that window stops the server gracefully (a watcher does it).
+# Already up   -> stop: close the tracked window, then graceful SIGTERM with
+#                 SIGKILL after 20s.
 #
 # Knobs live in ~/.config/deepseek-harness/launch.conf (see launch.conf.example):
-# DSH_PORT, DSH_NODE, DSH_EXTRA_ARGS, DSH_READY_TIMEOUT.
+# DSH_PORT, DSH_BROWSER, DSH_NODE, DSH_EXTRA_ARGS, DSH_READY_TIMEOUT.
 # The server always starts from the repository root: a source launch runs node
 # through tsx, which resolves the repo's tsconfig `paths` (source-level imports
 # such as @deepseek-ai/cordis) from the process working directory; any other cwd
@@ -30,10 +34,10 @@ if [ -n "${DSH_WORKSPACE:-}" ] && [ "$DSH_WORKSPACE" != "$dsh_repo_dir" ]; then
   dsh_notify 'DeepSeek Harness' "launch.conf sets DSH_WORKSPACE, which no longer changes the start directory. The server starts from $dsh_repo_dir; pick your project with Choose workspace in the Web UI."
 fi
 
-# Wait for the listening port, then hand the browser the newest authenticated URL
-# the server logged, falling back to the bare origin.
-# @returns 0 when a URL reached the browser, 2 when the server died, 3 on timeout.
-wait_and_open() {
+# Wait for the listening port, then print the newest authenticated URL the
+# server logged (falling back to the bare origin).
+# @returns 0 and prints a URL, 2 when our server died while waiting, 3 on timeout.
+wait_for_url() {
   local waited=0 boot_wait=0 url='' pid_seen=0
   while [ "$waited" -lt "$((ready_timeout + 20))" ]; do
     if dsh_port_open "$port"; then
@@ -41,13 +45,7 @@ wait_and_open() {
         sleep 1
         boot_wait=$((boot_wait + 1))
       done
-      [ -n "$url" ] || url=$origin
-      if dsh_open_url "$url"; then
-        return 0
-      fi
-      dsh_stop_with_error 'DeepSeek Harness' "The server is listening on $origin, but no browser opened. Open this address, which the server printed to its log:
-
-$url"
+      printf '%s\n' "${url:-$origin}"
       return 0
     fi
     if [ -f "$dsh_web_pid_file" ]; then
@@ -63,7 +61,6 @@ $url"
 }
 
 # Print the tail of the server log for an error dialog.
-# @returns the log lines, or a note naming the missing file.
 dsh_log_tail() {
   if [ -s "$dsh_web_log" ]; then
     tail -n 15 "$dsh_web_log"
@@ -72,25 +69,49 @@ dsh_log_tail() {
   fi
 }
 
-# Already listening: focus the running server instead of starting a second one.
-if dsh_port_open "$port"; then
-  if dsh_pid_alive "$dsh_web_pid_file"; then
-    dsh_notify 'DeepSeek Harness' "The Web UI is already running on $origin; opening it."
-    wait_and_open || true
-    exit 0
+# Open $1 in a dedicated, watchable browser window and start the watcher that
+# stops the server when the window closes; falls back to the default browser
+# (without auto-stop) when no trackable browser exists.
+open_window() {
+  local url=$1
+  if dsh_launch_tracked_browser "$url"; then
+    dsh_spawn_window_watcher
+    return 0
   fi
-  dsh_notify 'DeepSeek Harness' "Port $port is already serving something. If that is a DeepSeek Harness server you started in a terminal, open the URL it printed. To start another one here, set DSH_PORT in $dsh_config_file and double-click again."
+  dsh_open_url "$url" || true
+  dsh_notify 'DeepSeek Harness' "No trackable browser (Chrome/Chromium/Firefox) was found, so the UI opened in your default browser. Closing its window will NOT stop the server; double-click DeepSeek Harness again to stop it."
+}
+
+# Open the window for a ready server and report success.
+announce_ready() {
+  open_window "$1"
+  dsh_notify 'DeepSeek Harness' "DeepSeek Harness is serving on $origin. Close its window (or double-click DeepSeek Harness again) to stop it."
+}
+
+# --- Toggle off: our server is up -> close the window and stop gracefully. --
+if dsh_port_open "$port" && dsh_pid_alive "$dsh_web_pid_file"; then
+  dsh_close_tracked_browser
+  exec "$here/dsh-stop.sh"
+fi
+
+# --- A foreign server owns the port: open it, touch nothing. -----------------
+if dsh_port_open "$port"; then
+  dsh_notify 'DeepSeek Harness' "Port $port is already serving something else. If that is a DeepSeek Harness server you started in a terminal, open the URL it printed. To start another one here, set DSH_PORT in $dsh_config_file and double-click again."
   dsh_open_url "$origin" || true
   exit 0
 fi
 
-# A live pid with a closed port means the server is still booting.
+# --- A live pid with a closed port means the server is still booting. --------
 if dsh_pid_alive "$dsh_web_pid_file"; then
   dsh_notify 'DeepSeek Harness' 'DeepSeek Harness is still starting.'
-  if wait_and_open; then
+  status=0
+  url=''
+  url=$(wait_for_url) || status=$?
+  if [ "$status" -eq 0 ]; then
+    announce_ready "$url"
     exit 0
   fi
-  dsh_stop_with_error 'DeepSeek Harness' "The server started earlier did not become ready on port $port. Use the DeepSeek Harness (Stop) entry, then start again. Log tail:
+  dsh_stop_with_error 'DeepSeek Harness' "The server started earlier did not become ready on port $port. Double-click DeepSeek Harness again to stop it, then start once more. Log tail:
 
 $(dsh_log_tail)"
   exit 1
@@ -151,15 +172,22 @@ setsid bash -c '
   "$node" --import "$loader" "$dsh_repo_dir/apps/cli/src/bin.ts" web --port "$port" --no-open ${DSH_EXTRA_ARGS:-} &
 
 status=0
-wait_and_open || status=$?
+url=''
+url=$(wait_for_url) || status=$?
 case $status in
-0) dsh_notify 'DeepSeek Harness' "DeepSeek Harness is serving on $origin. Log: $dsh_web_log" ;;
+0)
+  announce_ready "$url"
+  ;;
 2)
   dsh_stop_with_error 'DeepSeek Harness' "The server exited during startup. Log tail:
 
 $(dsh_log_tail)"
+  exit 1
   ;;
-3) dsh_stop_with_error 'DeepSeek Harness' "The server did not start listening on port $port within ${ready_timeout}s. Log: $dsh_web_log" ;;
-*) ;;
+*)
+  dsh_stop_with_error 'DeepSeek Harness' "The server did not start within ${ready_timeout}s. Check the log, then double-click DeepSeek Harness again to stop and retry:
+
+$(dsh_log_tail)"
+  exit 1
+  ;;
 esac
-exit "$status"

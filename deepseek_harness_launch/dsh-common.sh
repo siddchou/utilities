@@ -14,6 +14,7 @@ dsh_state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/deepseek-harness-launcher
 dsh_config_file=${XDG_CONFIG_HOME:-$HOME/.config}/deepseek-harness/launch.conf
 dsh_web_log=$dsh_state_dir/web.log
 dsh_web_pid_file=$dsh_state_dir/web.pid
+dsh_browser_pid_file=$dsh_state_dir/browser.pid
 dsh_build_log=$dsh_state_dir/build.log
 dsh_icon_file=$dsh_repo_dir/apps/desktop/resources/icon.svg
 
@@ -133,6 +134,80 @@ dsh_open_url() {
   command -v xdg-open >/dev/null 2>&1 || return 1
   setsid xdg-open "$1" >/dev/null 2>&1 &
   return 0
+}
+
+# Dedicated profile for the tracked UI window. A fresh profile forces
+# Chrome/Firefox into their own process instead of handing the URL to an
+# already-running instance, so closing its window ends a process we can watch.
+# Kept across starts so the UI's cookie and localStorage survive restarts.
+dsh_browser_profile_dir=$dsh_state_dir/browser-profile
+
+# Launch $1 in a dedicated, watchable browser instance; records the pid of the
+# browser process in dsh_browser_pid_file. Honours DSH_BROWSER from launch.conf,
+# otherwise auto-detects a Chrome-family or Firefox binary.
+# @param $1 - absolute http(s) URL.
+# @returns 0 when a tracked window was launched, 1 when no trackable browser
+#   exists (the caller should fall back to dsh_open_url).
+dsh_launch_tracked_browser() {
+  local url=$1 bin='' candidate base
+  if [ -n "${DSH_BROWSER:-}" ]; then
+    bin=${DSH_BROWSER}
+  else
+    for candidate in google-chrome google-chrome-stable chromium chromium-browser \
+      brave-browser microsoft-edge firefox; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        bin=$(command -v -- "$candidate")
+        break
+      fi
+    done
+  fi
+  [ -n "$bin" ] && [ -x "$bin" ] || return 1
+  base=$(basename -- "$bin")
+  mkdir -p "$dsh_browser_profile_dir"
+  chmod 700 "$dsh_browser_profile_dir"
+  rm -f "$dsh_browser_pid_file"
+  # The wrapper records its own pid before exec'ing the browser, so the pid
+  # file holds the browser process itself regardless of setsid forking.
+  if [ "${base#firefox}" != "$base" ]; then
+    setsid bash -c 'printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
+      _ "$dsh_browser_pid_file" "$bin" --no-remote "--profile" "$dsh_browser_profile_dir" "$url" >/dev/null 2>&1 &
+  else
+    setsid bash -c 'printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
+      _ "$dsh_browser_pid_file" "$bin" "--user-data-dir=$dsh_browser_profile_dir" --no-first-run \
+        --no-default-browser-check --new-window "$url" >/dev/null 2>&1 &
+  fi
+  local waited=0
+  while [ ! -s "$dsh_browser_pid_file" ] && [ "$waited" -lt 40 ]; do
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  [ -s "$dsh_browser_pid_file" ]
+}
+
+# Watch the tracked browser window: when its process exits (the user closed the
+# window), stop the server gracefully — unless a toggle-stop already did.
+dsh_spawn_window_watcher() {
+  local browser_pid
+  browser_pid=$(cat "$dsh_browser_pid_file" 2>/dev/null) || return 0
+  case $browser_pid in ('' | *[!0-9]*) return 0 ;; esac
+  setsid bash -c '
+    browser_pid=$1; web_pid_file=$2; stop_script=$3
+    while kill -0 "$browser_pid" 2>/dev/null; do sleep 3; done
+    [ -f "$web_pid_file" ] || exit 0
+    server_pid=$(cat "$web_pid_file" 2>/dev/null) || exit 0
+    case $server_pid in ("" | *[!0-9]*) exit 0 ;; esac
+    kill -0 "$server_pid" 2>/dev/null || exit 0
+    exec "$stop_script"
+  ' _ "$browser_pid" "$dsh_web_pid_file" "$dsh_launcher_dir/dsh-stop.sh" >/dev/null 2>&1 &
+}
+
+# Close the tracked UI window, if one is open (used by every stop path).
+dsh_close_tracked_browser() {
+  local bpid
+  [ -f "$dsh_browser_pid_file" ] || return 0
+  bpid=$(cat "$dsh_browser_pid_file" 2>/dev/null) || return 0
+  case $bpid in ('' | *[!0-9]*) ;; (*) kill -TERM "$bpid" 2>/dev/null || true ;; esac
+  rm -f "$dsh_browser_pid_file"
 }
 
 # Whether the recorded server process is still alive.

@@ -35,6 +35,7 @@ if ! dsh_pid_alive "$dsh_web_pid_file"; then
   # A server started from a terminal in this checkout has no pid file here.
   leftovers=$(pgrep -f "$dsh_repo_dir/apps/cli/src/bin.ts.*web" 2>/dev/null || true)
   if [ -z "$leftovers" ]; then
+    dsh_close_tracked_browser
     dsh_notify 'DeepSeek Harness' "No DeepSeek Harness server was started by this folder's launcher, and nothing else in this checkout is running. Port $port is untouched if something else owns it."
     exit 0
   fi
@@ -42,6 +43,7 @@ if ! dsh_pid_alive "$dsh_web_pid_file"; then
   for pid in $leftovers; do
     dsh_terminate "$pid" && stopped="$stopped $pid"
   done
+  dsh_close_tracked_browser
   dsh_notify 'DeepSeek Harness' "Stopped the DeepSeek Harness server process(es) started from this checkout:${stopped:- none survived}. A terminal that still shows a running server can be closed."
   exit 0
 fi
@@ -49,6 +51,7 @@ fi
 pid=$(cat "$dsh_web_pid_file")
 if dsh_terminate "$pid"; then
   rm -f "$dsh_web_pid_file"
+  dsh_close_tracked_browser
   dsh_notify 'DeepSeek Harness' "DeepSeek Harness stopped (process $pid). Double-click DeepSeek Harness to start it again."
   exit 0
 fi

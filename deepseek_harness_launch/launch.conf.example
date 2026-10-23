@@ -9,6 +9,12 @@ DSH_REPO=/home/schou08/Applications/deepseek-harness
 # already-running check and the URL it opens always agree.
 DSH_PORT=3080
 
+# Browser binary for the dedicated UI window (auto-detected by default:
+# Chrome-family or Firefox). It runs with its own profile under
+# ~/.local/state/deepseek-harness-launcher/browser-profile, so closing that
+# window stops the server. Set a path if auto-detection picks the wrong one.
+#DSH_BROWSER=/usr/bin/google-chrome
+
 # (Retired) DSH_WORKSPACE no longer changes anything: a source launch must start
 # from the repository root so tsx resolves the repo's tsconfig paths, and the Web
 # UI's "Choose workspace" picks where the agent works. Remove it if present.

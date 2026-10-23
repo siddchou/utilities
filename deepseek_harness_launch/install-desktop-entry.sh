@@ -9,9 +9,11 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 default_repo=/home/schou08/Applications/deepseek-harness
 apps_dir=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 config_file=${XDG_CONFIG_HOME:-$HOME/.config}/deepseek-harness/launch.conf
+# The merged start/stop toggle and the build entry. dsh-stop.sh stays in this
+# folder for terminal use (and is what the window watcher runs), but it is no
+# longer a menu entry.
 entries=(
   deepseek-harness.desktop
-  deepseek-harness-stop.desktop
   deepseek-harness-build.desktop
 )
 executables=(
@@ -42,6 +44,8 @@ if [ "${1:-}" = '--uninstall' ]; then
     remove_entry "$apps_dir/$entry"
     gio set -- "$here/$entry" metadata::trusted false >/dev/null 2>&1 || true
   done
+  # The merged toggle replaced the separate Stop entry; drop a stale one.
+  [ -L "$apps_dir/deepseek-harness-stop.desktop" ] && rm -f -- "$apps_dir/deepseek-harness-stop.desktop"
   if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
   fi
@@ -71,6 +75,9 @@ for entry in "${entries[@]}"; do
   remove_entry "$apps_dir/$entry"
   ln -sfn -- "$here/$entry" "$apps_dir/$entry"
 done
+# The merged toggle replaced the separate Stop entry; drop a stale registration
+# (symlinks only, so a foreign file of that name is left alone).
+[ -L "$apps_dir/deepseek-harness-stop.desktop" ] && rm -f -- "$apps_dir/deepseek-harness-stop.desktop"
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
 fi

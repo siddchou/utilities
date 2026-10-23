@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=DeepSeek Harness
+GenericName=AI agent harness
+Comment=Start the DeepSeek Harness Web UI and open it in the browser
+Keywords=ai;agent;llm;coding;deepseek;terminal;
+Exec=/home/schou08/github/utilities/deepseek_harness_launch/dsh-web.sh
+Icon=/home/schou08/Applications/deepseek-harness/apps/desktop/resources/icon.svg
+Terminal=false
+NoDisplay=false
+Categories=Development;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Double-click or app-grid entry: start the DeepSeek Harness Web UI, or bring the
+# server that is already running back into the browser.
+#
+# Knobs live in ~/.config/deepseek-harness/launch.conf (see launch.conf.example):
+# DSH_PORT, DSH_NODE, DSH_EXTRA_ARGS, DSH_READY_TIMEOUT.
+# The server always starts from the repository root: a source launch runs node
+# through tsx, which resolves the repo's tsconfig `paths` (source-level imports
+# such as @deepseek-ai/cordis) from the process working directory; any other cwd
+# falls back to built bundles that lack const-enum exports and crash at boot.
+# The Web UI's "Choose workspace" picks where the agent works.
+set -euo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=dsh-common.sh
+. "$here/dsh-common.sh"
+
+# shellcheck source=/dev/null
+[ -f "$dsh_config_file" ] && . "$dsh_config_file"
+# launch.conf may point at a different checkout than the default.
+dsh_repo_dir=${DSH_REPO:-$dsh_default_repo}
+
+port=${DSH_PORT:-3080}
+ready_timeout=${DSH_READY_TIMEOUT:-180}
+origin="http://127.0.0.1:$port"
+dsh_use_full_path
+
+# A launch.conf from before the workspace knob was retired: say where it went.
+if [ -n "${DSH_WORKSPACE:-}" ] && [ "$DSH_WORKSPACE" != "$dsh_repo_dir" ]; then
+  dsh_notify 'DeepSeek Harness' "launch.conf sets DSH_WORKSPACE, which no longer changes the start directory. The server starts from $dsh_repo_dir; pick your project with Choose workspace in the Web UI."
+fi
+
+# Wait for the listening port, then hand the browser the newest authenticated URL
+# the server logged, falling back to the bare origin.
+# @returns 0 when a URL reached the browser, 2 when the server died, 3 on timeout.
+wait_and_open() {
+  local waited=0 boot_wait=0 url='' pid_seen=0
+  while [ "$waited" -lt "$((ready_timeout + 20))" ]; do
+    if dsh_port_open "$port"; then
+      while [ "$boot_wait" -lt 10 ] && ! url=$(dsh_last_web_url "$dsh_web_log"); do
+        sleep 1
+        boot_wait=$((boot_wait + 1))
+      done
+      [ -n "$url" ] || url=$origin
+      if dsh_open_url "$url"; then
+        return 0
+      fi
+      dsh_stop_with_error 'DeepSeek Harness' "The server is listening on $origin, but no browser opened. Open this address, which the server printed to its log:
+
+$url"
+      return 0
+    fi
+    if [ -f "$dsh_web_pid_file" ]; then
+      pid_seen=1
+      dsh_pid_alive "$dsh_web_pid_file" || return 2
+    elif [ "$waited" -ge 15 ] && [ "$pid_seen" -eq 0 ]; then
+      return 2
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 3
+}
+
+# Print the tail of the server log for an error dialog.
+# @returns the log lines, or a note naming the missing file.
+dsh_log_tail() {
+  if [ -s "$dsh_web_log" ]; then
+    tail -n 15 "$dsh_web_log"
+  else
+    printf '(no log output at %s yet)\n' "$dsh_web_log"
+  fi
+}
+
+# Already listening: focus the running server instead of starting a second one.
+if dsh_port_open "$port"; then
+  if dsh_pid_alive "$dsh_web_pid_file"; then
+    dsh_notify 'DeepSeek Harness' "The Web UI is already running on $origin; opening it."
+    wait_and_open || true
+    exit 0
+  fi
+  dsh_notify 'DeepSeek Harness' "Port $port is already serving something. If that is a DeepSeek Harness server you started in a terminal, open the URL it printed. To start another one here, set DSH_PORT in $dsh_config_file and double-click again."
+  dsh_open_url "$origin" || true
+  exit 0
+fi
+
+# A live pid with a closed port means the server is still booting.
+if dsh_pid_alive "$dsh_web_pid_file"; then
+  dsh_notify 'DeepSeek Harness' 'DeepSeek Harness is still starting.'
+  if wait_and_open; then
+    exit 0
+  fi
+  dsh_stop_with_error 'DeepSeek Harness' "The server started earlier did not become ready on port $port. Use the DeepSeek Harness (Stop) entry, then start again. Log tail:
+
+$(dsh_log_tail)"
+  exit 1
+fi
+
+node=$(dsh_find_node) || {
+  dsh_stop_with_error 'DeepSeek Harness' "Node.js was not found. Install Node.js 22.19+ or 24+, or set DSH_NODE in $dsh_config_file to the node executable."
+  exit 1
+}
+dsh_node_supported "$node" || {
+  dsh_stop_with_error 'DeepSeek Harness' "$("$node" -v 2>/dev/null || echo 'The node executable found') is too old. DeepSeek Harness needs Node.js ^22.19 || >=24; set DSH_NODE in $dsh_config_file to a newer executable."
+  exit 1
+}
+[ -d "$dsh_repo_dir/node_modules" ] || {
+  dsh_stop_with_error 'DeepSeek Harness' "Dependencies are missing. Run this in $dsh_repo_dir and then start again:
+
+  pnpm install"
+  exit 1
+}
+dsh_artifacts_ready "$node" || {
+  dsh_stop_with_error 'DeepSeek Harness' "The built Web artifacts are not present. Double-click DeepSeek Harness (Build), or run this in $dsh_repo_dir and then start again:
+
+  pnpm run build:artifacts"
+  exit 1
+}
+
+loader=$(dsh_tsx_loader "$node") || {
+  dsh_stop_with_error 'DeepSeek Harness' "The tsx loader is missing from $dsh_repo_dir/node_modules. Run this in $dsh_repo_dir and then start again:
+
+  pnpm install"
+  exit 1
+}
+
+umask 077
+mkdir -p "$dsh_state_dir"
+chmod 700 "$dsh_state_dir"
+# The log holds the Web launch token, so it stays owner-only and bounded in size.
+if [ -f "$dsh_web_log" ] && [ "$(stat -c %s "$dsh_web_log" 2>/dev/null || echo 0)" -gt 2097152 ]; then
+  tail -c 262144 "$dsh_web_log" >"$dsh_web_log.tmp" && mv -f "$dsh_web_log.tmp" "$dsh_web_log"
+fi
+touch "$dsh_web_log"
+chmod 600 "$dsh_web_log"
+
+printf '\n===== %s  launch: %s web --port %s\n' "$(date '+%Y-%m-%d %H:%M:%S%z')" \
+  "$node" "$port" >>"$dsh_web_log"
+
+# New session, so the server outlives this launcher. The recorded pid is the
+# server process itself: the inner bash execs node after writing its own pid.
+setsid bash -c '
+  pid_file=$1; shift
+  log_file=$1; shift
+  repo_dir=$1; shift
+  printf "%s\n" "$$" >"$pid_file"
+  chmod 600 "$pid_file"
+  cd "$repo_dir" || exit 1
+  exec "$@" >>"$log_file" 2>&1 </dev/null
+' _ "$dsh_web_pid_file" "$dsh_web_log" "$dsh_repo_dir" \
+  "$node" --import "$loader" "$dsh_repo_dir/apps/cli/src/bin.ts" web --port "$port" --no-open ${DSH_EXTRA_ARGS:-} &
+
+status=0
+wait_and_open || status=$?
+case $status in
+0) dsh_notify 'DeepSeek Harness' "DeepSeek Harness is serving on $origin. Log: $dsh_web_log" ;;
+2)
+  dsh_stop_with_error 'DeepSeek Harness' "The server exited during startup. Log tail:
+
+$(dsh_log_tail)"
+  ;;
+3) dsh_stop_with_error 'DeepSeek Harness' "The server did not start listening on port $port within ${ready_timeout}s. Log: $dsh_web_log" ;;
+*) ;;
+esac
+exit "$status"

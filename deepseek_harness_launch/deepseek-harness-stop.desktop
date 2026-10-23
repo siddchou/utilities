@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=DeepSeek Harness (Stop)
+GenericName=AI agent harness
+Comment=Stop the DeepSeek Harness Web UI server started by this folder
+Keywords=ai;agent;deepseek;stop;server;
+Exec=/home/schou08/github/utilities/deepseek_harness_launch/dsh-stop.sh
+Icon=/home/schou08/Applications/deepseek-harness/apps/desktop/resources/icon.svg
+Terminal=false
+NoDisplay=false
+Categories=Development;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

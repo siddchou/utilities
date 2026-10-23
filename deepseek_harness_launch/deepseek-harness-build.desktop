@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=DeepSeek Harness (Build)
+GenericName=AI agent harness
+Comment=Build the DeepSeek Harness Web artifacts served by this folder
+Keywords=ai;agent;deepseek;build;pnpm;
+Exec=/home/schou08/github/utilities/deepseek_harness_launch/dsh-build.sh
+Icon=/home/schou08/Applications/deepseek-harness/apps/desktop/resources/icon.svg
+Terminal=false
+NoDisplay=false
+Categories=Development;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

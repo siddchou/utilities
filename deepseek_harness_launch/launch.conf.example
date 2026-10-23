@@ -1,0 +1,27 @@
+# Copy this file to ~/.config/deepseek-harness/launch.conf and edit it.
+# The launchers source it as a shell fragment, so keep plain NAME=value lines.
+
+# Path to your deepseek-harness source checkout: the folder with node_modules,
+# apps/, and the built artifacts (where you ran pnpm install && pnpm run build).
+DSH_REPO=/home/schou08/Applications/deepseek-harness
+
+# Port the Web server listens on. The launcher always passes --port, so its
+# already-running check and the URL it opens always agree.
+DSH_PORT=3080
+
+# (Retired) DSH_WORKSPACE no longer changes anything: a source launch must start
+# from the repository root so tsx resolves the repo's tsconfig paths, and the Web
+# UI's "Choose workspace" picks where the agent works. Remove it if present.
+
+# Absolute path to a node executable, for a desktop session whose PATH has none.
+# A desktop launch also searches ~/.local/bin, ~/opt/nodejs/bin, ~/.volta/bin,
+# ~/.npm-global/bin, /usr/local/bin, and /usr/bin.
+#DSH_NODE=/home/schou08/.local/bin/node
+
+# Seconds to wait for the server to start listening before reporting a failure.
+#DSH_READY_TIMEOUT=180
+
+# Extra `dsh web` flags, for example a fixed --host or a --trusted-host. Leave
+# --port and the browser-open flags to the launcher, which passes --no-open and
+# opens the authenticated URL the server printed.
+#DSH_EXTRA_ARGS=

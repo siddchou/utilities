@@ -33,13 +33,13 @@
 #   STRATA_MODEL              model id as served  (default: discovered from /v1/models)
 #   STRATA_KEY                bearer token        (default: strata-local; loopback, unchecked)
 #   STRATA_CONTEXT            served context      (default: from the Strata tuning preset)
-#   STRATA_MAX_OUTPUT_TOKENS  output cap          (default: 4096)
+#   STRATA_MAX_OUTPUT_TOKENS  output cap          (default: 131072)
 #   SHIM_PORT                 Desktop shim port   (default: 4001)
 #   SHIM_THINKING             keep | off          (default: keep; off forces
 #                                                  thinking disabled -> faster
 #                                                  first text token, more budget
 #                                                  for the answer itself)
-#   SHIM_MIN_MAX_TOKENS       output-token floor  (default: 16384; Desktop chat
+#   SHIM_MIN_MAX_TOKENS       output-token floor  (default: 131072; Desktop chat
 #                                                  asks for 4096, the thinking
 #                                                  pass eats most of it and the
 #                                                  reply stops mid-sentence. 0
@@ -65,11 +65,11 @@ STRATA_URL="${STRATA_URL:-http://127.0.0.1:47831}"
 STRATA_MODEL="${STRATA_MODEL:-}"
 STRATA_KEY="${STRATA_KEY:-strata-local}"
 STRATA_CONTEXT="${STRATA_CONTEXT:-}"
-STRATA_MAX_OUTPUT_TOKENS="${STRATA_MAX_OUTPUT_TOKENS:-4096}"
+STRATA_MAX_OUTPUT_TOKENS="${STRATA_MAX_OUTPUT_TOKENS:-131072}"
 SHIM_PORT="${SHIM_PORT:-4001}"
 SHIM_THINKING="${SHIM_THINKING:-keep}"
 case "$SHIM_THINKING" in keep|off) ;; *) echo "SHIM_THINKING must be 'keep' or 'off' (got '$SHIM_THINKING')" >&2; exit 2 ;; esac
-SHIM_MIN_MAX_TOKENS="${SHIM_MIN_MAX_TOKENS:-16384}"
+SHIM_MIN_MAX_TOKENS="${SHIM_MIN_MAX_TOKENS:-131072}"
 case "$SHIM_MIN_MAX_TOKENS" in
   ''|*[!0-9]*) echo "SHIM_MIN_MAX_TOKENS must be a non-negative integer (got '$SHIM_MIN_MAX_TOKENS')" >&2; exit 2 ;;
 esac

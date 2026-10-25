@@ -73,10 +73,10 @@ STRATA_URL=http://127.0.0.1:8080 STRATA_MODEL=qwen3-coder STRATA_CONTEXT=131072 
 | `STRATA_MODEL` | discovered from `/v1/models` | must be an id the server reports, or it 400s |
 | `STRATA_KEY` | `strata-local` | unused by the loopback server, sent as bearer |
 | `STRATA_CONTEXT` | from `~/.config/strata/presets` (else 32768) | drives auto-compaction |
-| `STRATA_MAX_OUTPUT_TOKENS` | `4096` | thinking tokens count toward this |
+| `STRATA_MAX_OUTPUT_TOKENS` | `131072` | thinking tokens count toward this. Claude Code subtracts it from `CLAUDE_CODE_MAX_CONTEXT_TOKENS` when it picks the compaction point, so a 128k cap on a 256k window compacts around 128k of prompt |
 | `SHIM_PORT` | `4001` | Desktop shim |
 | `SHIM_THINKING` | `keep` | `off` forces `thinking: {"type":"disabled"}` on Desktop requests: no thinking block, so reasoning stops eating the `max_tokens` budget and the answer starts as text. `keep` passes the app's choice through |
-| `SHIM_MIN_MAX_TOKENS` | `16384` | output-token floor for Desktop requests. The app asks for 4096 and Strata keeps a quarter of that for the answer, so thinking can leave ~1k tokens for the reply — or none. `0` leaves the app's value alone |
+| `SHIM_MIN_MAX_TOKENS` | `131072` | output-token floor for Desktop requests. The app asks for 4096 and Strata keeps a quarter of that for the answer, so thinking can leave ~1k tokens for the reply — or none. `0` leaves the app's value alone |
 | `DESKTOP_MODEL` | `claude-opus-4-6` | must exist in Desktop's bundled catalog |
 | `STALL_GUARD` | `1` | `0` skips the Stop hook that continues a turn the model abandoned (see Troubleshooting) |
 
@@ -268,8 +268,9 @@ strata connect claude-code --url http://127.0.0.1:47831 --check   # vendor's own
   `--fix-cowork-sandbox` (editing `~/.claude/settings.json`) does nothing for
   Desktop sessions.
 - **Replies stop mid-sentence, `stop_reason: max_tokens`** — thinking tokens
-  count against `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (4096). Raise it:
-  `STRATA_MAX_OUTPUT_TOKENS=8192 claude-strata`.
+  count against `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (131072 by default). If a reply
+  still truncates, check what the CLI actually sent before lowering the number:
+  `journalctl --user -u claude-strata-shim -f | grep max_tokens`.
 - **Compacting every turn, or never** — the served context and
   `CLAUDE_CODE_MAX_CONTEXT_TOKENS` disagree. Verify the number the setup
   detected (`--test` prints it) against the Strata preset.
@@ -317,7 +318,7 @@ strata connect claude-code --url http://127.0.0.1:47831 --check   # vendor's own
   `thinking limited to 3072 of max_tokens 4096 so the answer has room` and the turn
   ends `(length)` instead of `(stop)`. Worst case it ends `the reply reached max
   tokens while still thinking, so it has no answer` — an empty bubble. The shim
-  raises the floor (`SHIM_MIN_MAX_TOKENS`, 16384 by default); watch it with
+  raises the floor (`SHIM_MIN_MAX_TOKENS`, 131072 by default); watch it with
   `journalctl --user -u claude-strata-shim -f | grep max_tokens`. It costs nothing:
   Strata shortens `max_tokens` to fit the prompt on its own anyway.
 - **Desktop: "Gateway /v1/models returned an unexpected body"** — Desktop is

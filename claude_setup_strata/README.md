@@ -180,6 +180,8 @@ a future app update may change or remove it.
 ../update-claude-desktop.sh --check                         # same checks, no root
 ../update-claude-desktop.sh --verify                        # after relaunch: is 3p still healthy?
 ./setup-claude-strata.sh --remove                           # uninstall everything this script wrote
+./fix-claude-bwrap-apparmor.sh --check                      # can sandboxed Bash nest namespaces?
+sudo ./fix-claude-bwrap-apparmor.sh                         # fix it if not (--revert undoes)
 systemctl --user status claude-strata-shim                  # shim health
 journalctl --user -u claude-strata-shim -f                  # shim logs
 curl -s localhost:4001/healthz                              # {"status":"ok","model":"..."}
@@ -198,19 +200,34 @@ strata connect claude-code --url http://127.0.0.1:47831 --check   # vendor's own
   wrapper normally self-heals by reading that on each launch.
 - **`[claude-code:unrecognized_model]` on stderr** — harmless: Claude Code
   notices the id isn't an Anthropic one. Strata documents it too.
-- **Desktop: replies stop half-finished, and shell commands fail with
+- **Replies stop half-finished, and every shell command fails with
   `apply-seccomp: write /proc/self/setgroups (nested userns is
   capability-restricted; caller must provide CAP_SYS_ADMIN): Permission denied`**
-  — run `./setup-claude-strata.sh --fix-cowork-sandbox`. Claude Desktop already
-  runs its CLI inside a user namespace, and Claude Code's own bubblewrap sandbox
-  then tries to nest a second one, which Linux refuses without `CAP_SYS_ADMIN`.
-  Every Bash call exits 1 before running, the model retries, announces a next
-  step and ends the turn — so the message looks truncated even though the
-  transport is fine. `bwrap` alone works; `bwrap` inside `bwrap` does not, which
-  is how to tell this apart from a server problem. The fix disables the *inner*
-  sandbox in `~/.claude/settings.json`; Desktop still sandboxes the CLI itself.
-  If a future build pushes its own settings payload over that key, flip the
-  app's own sandbox/VM setting instead.
+  — run `./fix-claude-bwrap-apparmor.sh --check`. The cause is Ubuntu's AppArmor
+  policy, not Desktop and not `~/.claude/settings.json`: because
+  `kernel.apparmor_restrict_unprivileged_userns=1`, Ubuntu ships
+  `/etc/apparmor.d/bwrap-userns-restrict`, whose `unpriv_bwrap` profile is
+  `audit deny capability` — so everything inside `bwrap` starts with `CapEff 0`.
+  Claude Code's Linux sandbox is `bwrap` plus its `apply-seccomp` helper, which
+  needs a nested user namespace and `CAP_SYS_ADMIN` to install the Unix-socket
+  seccomp filter, so each Bash call exits 1 before running; the model retries,
+  announces a next step and ends the turn, so the reply looks truncated even
+  though the transport is fine. Confirm it directly:
+  `bwrap --ro-bind / / --dev /dev --proc /proc -- unshare -Ur /bin/true` fails on
+  the mapping *write*, not on namespace creation. Fix:
+  `sudo ./fix-claude-bwrap-apparmor.sh`, which installs Anthropic's
+  `profile bwrap /usr/bin/bwrap flags=(unconfined) { userns, }` and disables
+  Ubuntu's same-named profile (alphabetically later, so it would otherwise win on
+  reload). `--scoped` keeps Ubuntu's rule for `/usr/bin/bwrap` and grants `userns`
+  to a private copy pointed at through `sandbox.bwrapPath`; `--revert` undoes
+  either. Unprivileged user namespaces stay blocked for everything else, and
+  sandboxed file/network isolation is unchanged. `./diag-bwrap-apparmor.sh`
+  re-tests under sudo if a future Ubuntu update regresses it. Quit Claude Desktop
+  completely afterwards: it starts the CLI with `--managed-settings` forcing
+  `sandbox.enabled=true` and `allowUnsandboxedCommands=false`, so sandboxed Bash is
+  always on there and no settings file can switch it off — which is why the older
+  `--fix-cowork-sandbox` (editing `~/.claude/settings.json`) does nothing for
+  Desktop sessions.
 - **Replies stop mid-sentence, `stop_reason: max_tokens`** — thinking tokens
   count against `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (4096). Raise it:
   `STRATA_MAX_OUTPUT_TOKENS=8192 claude-strata`.

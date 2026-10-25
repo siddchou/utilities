@@ -131,9 +131,10 @@ if [ "$REMOVE" -eq 1 ]; then
   # A Strata model id never starts with "claude", so a real Anthropic id you set
   # yourself survives even when the setup probe cannot reach the server.
   if [ -f "$SETTINGS_JSON" ]; then
-    python3 - "$SETTINGS_JSON" "$(api_root)" "$STRATA_KEY" "$(curl -s --max-time 3 "$(health_url)" 2>/dev/null || true)" <<'PY' || true
+    python3 - "$SETTINGS_JSON" "$(api_root)" "$STRATA_KEY" "$(curl -s --max-time 3 "$(health_url)" 2>/dev/null || true)" "http://localhost:$SHIM_PORT/" "$DESKTOP_MODELS" <<'PY' || true
 import json, re, sys
 path, url, key, models_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+shim_url, advertised = sys.argv[5], set(sys.argv[6].split(","))
 try:
     cfg = json.load(open(path))
 except Exception:
@@ -142,9 +143,10 @@ env = cfg.get("env") or {}
 
 live = set(re.findall(r'"id"\s*:\s*"([^"]+)"', models_json))
 def ours_model(v):
-    return isinstance(v, str) and bool(v) and (v in live or not v.lower().startswith("claude"))
+    # advertised: the catalog names written when settings.json points at the shim
+    return isinstance(v, str) and bool(v) and (v in live or v in advertised or not v.lower().startswith("claude"))
 
-removed = [k for k, v in (("ANTHROPIC_BASE_URL", url), ("ANTHROPIC_AUTH_TOKEN", key)) if env.get(k) == v]
+removed = [k for k, v in (("ANTHROPIC_BASE_URL", (url, shim_url)), ("ANTHROPIC_AUTH_TOKEN", (key,))) if env.get(k) in v]
 removed += [k for k in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                         "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL")
             if ours_model(env.get(k))]
@@ -399,7 +401,21 @@ echo "Wrote $BIN_DIR/claude-strata (model auto-detected at launch, default ${STR
 log "4/5 App configuration"
 if [ "$WRITE_SETTINGS" -eq 1 ]; then
   mkdir -p "$(dirname "$SETTINGS_JSON")"
-  python3 - "$SETTINGS_JSON" "$(api_root)" "$STRATA_MODEL" "$STRATA_KEY" "$STRATA_CONTEXT" "$STRATA_MAX_OUTPUT_TOKENS" <<'PY'
+  # Claude Code applies settings.json `env` over the environment it inherits, so
+  # ANTHROPIC_BASE_URL here also wins over the base URL Claude Desktop injects
+  # into its own CLI. Where the shim is wired up, write the shim: that is the
+  # endpoint Desktop already uses, and it maps the catalog name back to the
+  # loaded model id. Pointing at Strata instead would make Desktop's CLI skip
+  # the shim and get 400 "Choose a loaded model ID."
+  SETTINGS_URL="$(api_root)"
+  SETTINGS_MODEL="$STRATA_MODEL"
+  if [ "$WITH_DESKTOP" -eq 1 ] || [ -f "$UNIT_DIR/claude-strata-shim.service" ]; then
+    SETTINGS_URL="http://localhost:$SHIM_PORT/"
+    SETTINGS_MODEL="$DESKTOP_MODEL"
+    have_systemd || echo "No systemd user session: the shim (and Desktop) must be" \
+                     "running for plain 'claude' to reach $SETTINGS_URL"
+  fi
+  python3 - "$SETTINGS_JSON" "$SETTINGS_URL" "$SETTINGS_MODEL" "$STRATA_KEY" "$STRATA_CONTEXT" "$STRATA_MAX_OUTPUT_TOKENS" <<'PY'
 import json, os, shutil, sys
 path, url, model, key, ctx, max_out = sys.argv[1:7]
 cfg = {}
@@ -541,6 +557,11 @@ SHIM_SERVICE=claude-strata-shim
 DESKTOP_BIN="${CLAUDE_DESKTOP_BIN:-__DESKTOP_BIN__}"
 LOG="$HOME/claude-desktop-strata.log"
 
+# Desktop spawns its own Claude Code and sets only ANTHROPIC_BASE_URL on it, so
+# without this the CLI compacts at its built-in default (~200k) while Strata
+# serves more. Exported here, it inherits through Electron into that CLI.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-__CTX__}"
+
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
 
 # Never let a repeated failure grow the log without bound.
@@ -641,7 +662,7 @@ wait "$child"; rc=$?
 cleanup
 exit $rc
 DESKWRAPPEOF
-  fill "$BIN_DIR/claude-desktop-strata" __SHIM_PORT__ "$SHIM_PORT" __SHIM_UPSTREAM__ "$(api_root)" __DESKTOP_MODELS__ "$DESKTOP_MODELS" __THINKING__ "$SHIM_THINKING" __DESKTOP_BIN__ "$DESKTOP_REAL"
+  fill "$BIN_DIR/claude-desktop-strata" __SHIM_PORT__ "$SHIM_PORT" __SHIM_UPSTREAM__ "$(api_root)" __DESKTOP_MODELS__ "$DESKTOP_MODELS" __THINKING__ "$SHIM_THINKING" __DESKTOP_BIN__ "$DESKTOP_REAL" __CTX__ "$STRATA_CONTEXT"
   chmod +x "$BIN_DIR/claude-desktop-strata"
   ln -sfn claude-desktop-strata "$BIN_DIR/claude-desktop"
   echo "Wrote $BIN_DIR/claude-desktop-strata (+ claude-desktop -> it)"
@@ -746,7 +767,14 @@ print("configLibrary id:", entry_id)
 PY
 
   if have_systemd; then
-    systemctl --user disable claude-strata-shim 2>/dev/null || true
+    if [ "$WRITE_SETTINGS" -eq 1 ]; then
+      # settings.json points plain 'claude' at the shim, so it has to survive
+      # without Desktop; with --desktop alone it still comes and goes with the app.
+      systemctl --user enable claude-strata-shim 2>/dev/null || true
+      echo "Shim enabled at login (plain 'claude' needs it running)."
+    else
+      systemctl --user disable claude-strata-shim 2>/dev/null || true
+    fi
     systemctl --user restart claude-strata-shim 2>/dev/null || true
   fi
   echo "Fully quit Claude Desktop (tray -> Quit) and relaunch it through the app"

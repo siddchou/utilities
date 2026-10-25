@@ -55,6 +55,11 @@ sudo ./install-claude-desktop.sh      # Anthropic apt repo -> /usr/bin/claude-de
 so a plain `claude` launch uses Strata too. Without it only `claude-strata` is
 affected, which is usually what you want.
 
+Combined with `--desktop` it writes the **shim** (`http://localhost:4001/`) as the
+endpoint instead of Strata, and enables `claude-strata-shim` at login so terminal
+launches work with Desktop closed — see the note below on why a bare Strata URL
+there would break Desktop.
+
 ## Configure a different server / model
 
 ```bash
@@ -129,9 +134,19 @@ python3 -c 'import json,base64;d=json.load(open("%s/.config/Claude-3p/model-cata
 Note that Desktop does **not** use the `claude` on your PATH for chat: it
 downloads and spawns its own CLI (`~/.config/Claude-3p/claude-code/<ver>/…/claude`)
 and injects the gateway settings into it. So local/Cowork sessions reach Strata
-through the shim regardless of `~/.claude/settings.json`, and `--write-settings`
-is not required for Desktop — it only changes what a plain `claude` in your own
-terminal does.
+through the shim, and `--write-settings` is not required for Desktop — it only
+changes what a plain `claude` in your own terminal does.
+
+But Claude Code applies `~/.claude/settings.json` `env` **over** the environment it
+inherits, so if you do use it, its `ANTHROPIC_BASE_URL` also wins over the URL
+Desktop injects: pointing it straight at Strata would make Desktop's CLI skip the
+shim and answer `400 "Choose a loaded model ID."`. That is why `--write-settings`
+with `--desktop` writes the shim URL instead — the endpoint Desktop uses anyway.
+
+The same file is why the window is set in the **launcher**: `claude-desktop-strata`
+exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (the context Strata was started with)
+before exec'ing the app, and it inherits through Electron into the CLI Desktop
+spawns — otherwise that CLI compacts at its built-in ~200k default.
 
 What `--desktop` writes:
 

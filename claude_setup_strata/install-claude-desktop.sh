@@ -7,11 +7,14 @@ EXPECTED_FPR="31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
 KEYRING="/usr/share/keyrings/claude-desktop-archive-keyring.asc"
 REPO_LIST="/etc/apt/sources.list.d/claude-desktop.list"
 
-# 0. Prerequisites (curl is missing on this machine)
-if ! command -v curl >/dev/null; then
-  echo ">> Installing curl + gnupg..."
+# 0. Prerequisites (curl may be missing; gpg is needed for the fingerprint check)
+missing=()
+command -v curl >/dev/null || missing+=(curl)
+command -v gpg  >/dev/null || missing+=(gnupg)
+if [[ "${#missing[@]}" -gt 0 ]]; then
+  echo ">> Installing ${missing[*]}..."
   sudo apt-get update
-  sudo apt-get install -y curl gnupg
+  sudo apt-get install -y "${missing[@]}"
 fi
 
 # 1. Download Anthropic's signing key

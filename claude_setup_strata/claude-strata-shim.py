@@ -239,6 +239,12 @@ class Handler(BaseHTTPRequestHandler):
     normalize_enabled = False
     desktop_models = list(DEFAULT_MODELS)
     thinking_mode = "keep"
+    response_started = False
+
+    def handle_one_request(self):
+        # one instance serves many keep-alive requests, so this flag is per-request
+        self.response_started = False
+        super().handle_one_request()
 
     def log_message(self, fmt, *args):  # errors go to stderr, stdout stays quiet
         sys.stderr.write("[strata-shim] %s\n" % (fmt % args))
@@ -293,6 +299,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        self.response_started = True
 
         try:
             while True:
@@ -331,6 +338,11 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("[strata-shim] client aborted %s\n" % path)
         except Exception as exc:  # noqa: BLE001 - report upstream failures to client
             sys.stderr.write("[strata-shim] error: %r\n" % (exc,))
+            if self.response_started:
+                # headers (and maybe part of an SSE stream) already went out;
+                # a second response would corrupt the stream - just cut it
+                self.close_connection = True
+                return
             try:
                 payload = json.dumps(
                     {"type": "error", "error": {"type": "api_error", "message": repr(exc)}}

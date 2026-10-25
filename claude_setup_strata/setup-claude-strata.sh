@@ -78,6 +78,20 @@ done
 
 log() { printf '\n\033[1;34m== %s ==\033[0m\n' "$*"; }
 
+# Literal placeholder substitution for the generated wrappers (sed would treat
+# & | and \ inside the values as replacement syntax).
+fill() {
+  local path=$1; shift
+  python3 - "$path" "$@" <<'PY'
+import sys
+path, pairs = sys.argv[1], sys.argv[2:]
+text = open(path).read()
+for i in range(0, len(pairs), 2):
+    text = text.replace(pairs[i], pairs[i + 1])
+open(path, "w").write(text)
+PY
+}
+
 # Claude Desktop 3p config lives here; the uuid file is our own so --remove can
 # find and delete exactly what we wrote.
 C3P_DIR="$HOME/.config/Claude-3p"
@@ -87,7 +101,9 @@ strip_v1() { local u="${1%/}"; printf '%s' "${u%/v1}"; }
 api_root() { printf '%s' "$(strip_v1 "$STRATA_URL")"; }
 health_url() { printf '%s/v1/models' "$(api_root)"; }
 
-have_systemd() { command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; }
+# status exits 3 when any user unit is dead/failed; show-environment only asks
+# whether the user manager answers at all.
+have_systemd() { command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; }
 
 # -----------------------------------------------------------------------------
 if [ "$REMOVE" -eq 1 ]; then
@@ -375,7 +391,7 @@ export CLAUDE_CODE_MAX_OUTPUT_TOKENS=$MAX_OUTPUT
 
 exec claude --model "$MODEL" "$@"
 WRAPPEOF
-sed -i "s|__URL__|$(api_root)|g; s|__KEY__|$STRATA_KEY|g; s|__CTX__|$STRATA_CONTEXT|g; s|__MAXOUT__|$STRATA_MAX_OUTPUT_TOKENS|g" "$BIN_DIR/claude-strata"
+fill "$BIN_DIR/claude-strata" __URL__ "$(api_root)" __KEY__ "$STRATA_KEY" __CTX__ "$STRATA_CONTEXT" __MAXOUT__ "$STRATA_MAX_OUTPUT_TOKENS"
 chmod +x "$BIN_DIR/claude-strata"
 echo "Wrote $BIN_DIR/claude-strata (model auto-detected at launch, default ${STRATA_CONTEXT} token window)"
 
@@ -390,9 +406,11 @@ cfg = {}
 if os.path.exists(path):
     try:
         cfg = json.load(open(path))
-    except Exception as exc:
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
         shutil.copy2(path, path + ".bak")
-        print("existing %s is not valid JSON; backed up to %s.bak and starting fresh" % (path, path))
+        print("existing %s is not a JSON object; backed up to %s.bak and starting fresh" % (path, path))
         cfg = {}
 env = cfg.setdefault("env", {})
 env.update({
@@ -409,7 +427,12 @@ env.update({
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(ctx),
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max_out),
 })
-json.dump(cfg, open(path, "w"), indent=2)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+if os.path.exists(path):
+    os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+os.replace(tmp, path)
 print("Wrote %s -> %s (%s)" % (path, url, model))
 PY
 else
@@ -444,7 +467,12 @@ if not isinstance(sb, dict):
     sb = {}
     cfg["sandbox"] = sb
 sb["enabled"] = False
-json.dump(cfg, open(path, "w"), indent=2)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+if os.path.exists(path):
+    os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+os.replace(tmp, path)
 print("Wrote %s -> sandbox.enabled = false" % path)
 print("(Desktop still sandboxes the CLI itself, so commands are not running bare.)")
 PY
@@ -546,7 +574,7 @@ if [ -n "${CLAUDE_DESKTOP_STRATA_ACTIVE:-}" ]; then
 fi
 
 have_systemd=0
-if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
   have_systemd=1
 fi
 up() { curl -s --max-time 3 "$1" >/dev/null 2>&1; }
@@ -564,6 +592,7 @@ desktop_running() {
 }
 
 started_shim=0
+shim_pid=""
 if ! up "http://localhost:$SHIM_PORT/healthz"; then
   started_shim=1
   if [ "$have_systemd" -eq 1 ]; then
@@ -574,6 +603,7 @@ if ! up "http://localhost:$SHIM_PORT/healthz"; then
     nohup /usr/bin/python3 "$HOME/.config/claude-strata/claude-strata-shim.py" \
       --port "$SHIM_PORT" --upstream "$SHIM_UPSTREAM" --models "$DESKTOP_MODELS" --thinking "$SHIM_THINKING" \
       >> ~/claude-strata-shim.log 2>&1 &
+    shim_pid=$!
   fi
 fi
 if up "http://localhost:$SHIM_PORT/healthz"; then
@@ -600,6 +630,9 @@ cleanup() {
   elif [ "$started_shim" -eq 1 ] && [ "$have_systemd" -eq 1 ]; then
     log "Claude Desktop exited - stopping the shim."
     systemctl --user stop "$SHIM_SERVICE" 2>>"$LOG" || true
+  elif [ "$started_shim" -eq 1 ] && [ -n "$shim_pid" ]; then
+    log "Claude Desktop exited - stopping the nohup shim (pid $shim_pid)."
+    kill "$shim_pid" 2>/dev/null || true
   fi
 }
 trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; cleanup; exit 130' INT
@@ -608,7 +641,7 @@ wait "$child"; rc=$?
 cleanup
 exit $rc
 DESKWRAPPEOF
-  sed -i "s|__SHIM_PORT__|$SHIM_PORT|g; s|__SHIM_UPSTREAM__|$(api_root)|g; s|__DESKTOP_MODELS__|$DESKTOP_MODELS|g; s|__THINKING__|$SHIM_THINKING|g; s|__DESKTOP_BIN__|$DESKTOP_REAL|g" "$BIN_DIR/claude-desktop-strata"
+  fill "$BIN_DIR/claude-desktop-strata" __SHIM_PORT__ "$SHIM_PORT" __SHIM_UPSTREAM__ "$(api_root)" __DESKTOP_MODELS__ "$DESKTOP_MODELS" __THINKING__ "$SHIM_THINKING" __DESKTOP_BIN__ "$DESKTOP_REAL"
   chmod +x "$BIN_DIR/claude-desktop-strata"
   ln -sfn claude-desktop-strata "$BIN_DIR/claude-desktop"
   echo "Wrote $BIN_DIR/claude-desktop-strata (+ claude-desktop -> it)"

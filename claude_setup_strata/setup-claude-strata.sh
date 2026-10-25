@@ -22,9 +22,10 @@
 #   ./setup-claude-strata.sh --test          # ...and run an end-to-end prompt
 #   ./setup-claude-strata.sh --write-settings # also write ~/.claude/settings.json
 #   ./setup-claude-strata.sh --desktop       # also wire Claude Desktop 3p via the shim
-#   ./setup-claude-strata.sh --fix-cowork-sandbox  # stop Claude Code's inner sandbox
-#                                          # nesting inside Desktop's (otherwise
-#                                          # every Bash tool call fails: seccomp)
+#   ./setup-claude-strata.sh --fix-cowork-sandbox  # check/repair sandboxed Bash:
+#                                          # Ubuntu's AppArmor rule for bwrap makes
+#                                          # every Bash tool call die in seccomp;
+#                                          # prints the one-time sudo repair
 #   ./setup-claude-strata.sh --remove        # remove everything this script wrote
 #
 # Configuration (environment variables):
@@ -38,7 +39,21 @@
 #                                                  thinking disabled -> faster
 #                                                  first text token, more budget
 #                                                  for the answer itself)
-#   DESKTOP_MODEL             catalog name for Desktop (default: claude-sonnet-4-6)
+#   SHIM_MIN_MAX_TOKENS       output-token floor  (default: 16384; Desktop chat
+#                                                  asks for 4096, the thinking
+#                                                  pass eats most of it and the
+#                                                  reply stops mid-sentence. 0
+#                                                  leaves the app's value alone)
+#   DESKTOP_MODEL             model name for Desktop's row (default: claude-opus-4-6)
+#   STALL_GUARD               1 | 0    (default: 1; installs the Stop hook that
+#                                     continues a turn the model abandoned by
+#                                     announcing a step and never calling a tool)
+#                             Has to be a name the app's catalog knows: anything
+#                             else leaves the picker empty ("picker = 0 (empty)" in
+#                             ~/.config/Claude-3p/logs/main.log) and no chat starts.
+#                             The name is also what Desktop hands its own CLI, and
+#                             Claude Code sizes a Claude-named model from its own
+#                             table (200k) instead of from STRATA_CONTEXT.
 #
 # Requires: Ubuntu 22.04+, curl, python3. No sudo needed (--desktop included);
 # installing the Claude Desktop .deb itself is what needs sudo, see
@@ -54,8 +69,14 @@ STRATA_MAX_OUTPUT_TOKENS="${STRATA_MAX_OUTPUT_TOKENS:-4096}"
 SHIM_PORT="${SHIM_PORT:-4001}"
 SHIM_THINKING="${SHIM_THINKING:-keep}"
 case "$SHIM_THINKING" in keep|off) ;; *) echo "SHIM_THINKING must be 'keep' or 'off' (got '$SHIM_THINKING')" >&2; exit 2 ;; esac
-DESKTOP_MODEL="${DESKTOP_MODEL:-claude-sonnet-4-6}"
-DESKTOP_MODELS="${DESKTOP_MODELS:-claude-sonnet-4-6,claude-sonnet-4-5}"
+SHIM_MIN_MAX_TOKENS="${SHIM_MIN_MAX_TOKENS:-16384}"
+case "$SHIM_MIN_MAX_TOKENS" in
+  ''|*[!0-9]*) echo "SHIM_MIN_MAX_TOKENS must be a non-negative integer (got '$SHIM_MIN_MAX_TOKENS')" >&2; exit 2 ;;
+esac
+DESKTOP_MODEL="${DESKTOP_MODEL:-claude-opus-4-6}"
+DESKTOP_MODELS="${DESKTOP_MODELS:-claude-opus-4-6,claude-sonnet-4-6}"
+STALL_GUARD="${STALL_GUARD:-1}"
+case "$STALL_GUARD" in 0|1) ;; *) echo "STALL_GUARD must be 0 or 1 (got '$STALL_GUARD')" >&2; exit 2 ;; esac
 
 BIN_DIR="$HOME/.local/bin"
 CFG_DIR="$HOME/.config/claude-strata"
@@ -110,8 +131,51 @@ if [ "$REMOVE" -eq 1 ]; then
   log "Removing claude-strata files (Claude Code itself is kept)"
   rm -f "$BIN_DIR/claude-strata"
   if [ -d "$CFG_DIR" ]; then
-    rm -f "$CFG_DIR/claude-strata-shim.py"
+    rm -f "$CFG_DIR/claude-strata-shim.py" "$CFG_DIR/claude-stall-guard.py"
     rmdir "$CFG_DIR" 2>/dev/null || true
+  fi
+
+  # Drop our Stop hook, leave anyone else's alone.
+  if [ -f "$SETTINGS_JSON" ]; then
+    python3 - "$SETTINGS_JSON" <<'PY' || true
+import json, os, sys
+path = sys.argv[1]
+try:
+    cfg = json.load(open(path))
+except Exception:
+    sys.exit(0)
+hooks = cfg.get("hooks") if isinstance(cfg, dict) else None
+groups = hooks.get("Stop") if isinstance(hooks, dict) else None
+if not isinstance(groups, list):
+    sys.exit(0)
+
+def ours(h):
+    return isinstance(h, dict) and "claude-stall-guard.py" in str(h.get("command", ""))
+
+kept, removed = [], 0
+for g in groups:
+    inner = g.get("hooks") if isinstance(g, dict) else None
+    if isinstance(inner, list) and any(ours(h) for h in inner):
+        removed += 1
+        rest = [h for h in inner if not ours(h)]
+        if rest:
+            kept.append(dict(g, hooks=rest))
+        continue
+    kept.append(g)
+if not removed:
+    sys.exit(0)
+if kept:
+    hooks["Stop"] = kept
+else:
+    hooks.pop("Stop", None)
+    if not hooks:
+        cfg.pop("hooks", None)
+tmp = path + ".tmp"
+json.dump(cfg, open(tmp, "w"), indent=2)
+os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+os.replace(tmp, path)
+print("Removed the stall-guard Stop hook from %s" % path)
+PY
   fi
 
   if have_systemd; then
@@ -164,7 +228,9 @@ print("cleaned %d key(s) from %s%s" % (len(removed), path,
 PY
   fi
 
-  # Undo --fix-cowork-sandbox: drop the sandbox key only if it is exactly ours.
+  # Undo an older --fix-cowork-sandbox run, which wrote that key; drop it only if
+  # it is exactly ours. The AppArmor repair itself is undone by
+  # fix-claude-bwrap-apparmor.sh --revert, not by --remove.
   if [ -f "$SETTINGS_JSON" ]; then
     python3 - "$SETTINGS_JSON" <<'PY' || true
 import json, sys
@@ -180,12 +246,14 @@ if isinstance(cfg, dict) and cfg.get("sandbox") == {"enabled": False}:
 PY
   fi
 
-  # Undo --desktop: delete the configLibrary entries we recognize (our
-  # labelOverride is the marker) + revert deploymentMode if nothing of ours is left.
+  # Undo --desktop: delete the configLibrary entries we recognize + revert
+  # deploymentMode if nothing of ours is left. Marker is the gateway URL plus our
+  # api key, never labelOverride: that string is what the app shows the user, so
+  # editing it must not turn our entry into somebody else's.
   if [ -d "$C3P_DIR/configLibrary" ]; then
-    python3 - "$C3P_DIR" "$SHIM_PORT" <<'PY' || true
+    python3 - "$C3P_DIR" "$SHIM_PORT" "$STRATA_KEY" <<'PY' || true
 import json, os, sys
-c3p, port = sys.argv[1], sys.argv[2]
+c3p, port, key = sys.argv[1], sys.argv[2], sys.argv[3]
 lib = os.path.join(c3p, "configLibrary")
 meta_p = os.path.join(lib, "_meta.json")
 try:
@@ -200,9 +268,8 @@ for eid in [e.get("id") for e in meta.get("entries", []) if isinstance(e, dict)]
     except Exception:
         continue
     ours = (d.get("inferenceProvider") == "gateway"
-            and str(d.get("inferenceGatewayBaseUrl", "")).rstrip("/").endswith("://localhost:%s" % port)
-            and any(isinstance(m, dict) and m.get("labelOverride") == "Strata (local)"
-                    for m in (d.get("inferenceModels") or [{}])))
+            and str(d.get("inferenceGatewayBaseUrl", "")).rstrip("/") == "http://localhost:%s" % port
+            and d.get("inferenceGatewayApiKey") == key)
     if not ours:
         print("kept %s (not written by this script)" % p)
         continue
@@ -257,6 +324,7 @@ if [ -z "$STRATA_MODEL" ]; then
     | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
 fi
 [ -n "$STRATA_MODEL" ] || { echo "Could not read a model id from $(health_url): $MODELS_JSON" >&2; exit 1; }
+SHIM_MODELS="$DESKTOP_MODELS,$STRATA_MODEL"
 
 # Served context: an explicit value wins, then the active Strata tuning preset.
 if [ -z "$STRATA_CONTEXT" ]; then
@@ -404,14 +472,20 @@ if [ "$WRITE_SETTINGS" -eq 1 ]; then
   # Claude Code applies settings.json `env` over the environment it inherits, so
   # ANTHROPIC_BASE_URL here also wins over the base URL Claude Desktop injects
   # into its own CLI. Where the shim is wired up, write the shim: that is the
-  # endpoint Desktop already uses, and it maps the catalog name back to the
-  # loaded model id. Pointing at Strata instead would make Desktop's CLI skip
-  # the shim and get 400 "Choose a loaded model ID."
+  # endpoint Desktop already uses, and it maps any name back to the loaded model
+  # id. Pointing at Strata instead would make Desktop's CLI skip the shim and get
+  # 400 "Choose a loaded model ID."
+  #
+  # The model name, though, stays the Strata id even on the shim path. Claude Code
+  # looks up a name that reads as a Claude model in its own table (200k for
+  # claude-opus-4-6) and never consults CLAUDE_CODE_MAX_CONTEXT_TOKENS for it,
+  # so a catalog name here would silently drop the served window. The id also has
+  # to survive the shim's rewrite, which it does: the shim replaces `model` with
+  # whatever Strata has loaded.
   SETTINGS_URL="$(api_root)"
   SETTINGS_MODEL="$STRATA_MODEL"
   if [ "$WITH_DESKTOP" -eq 1 ] || [ -f "$UNIT_DIR/claude-strata-shim.service" ]; then
     SETTINGS_URL="http://localhost:$SHIM_PORT/"
-    SETTINGS_MODEL="$DESKTOP_MODEL"
     have_systemd || echo "No systemd user session: the shim (and Desktop) must be" \
                      "running for plain 'claude' to reach $SETTINGS_URL"
   fi
@@ -456,45 +530,125 @@ else
   echo "default for every 'claude' launch; the claude-strata wrapper needs neither)."
 fi
 
-if [ "$FIX_SANDBOX" -eq 1 ]; then
-  # Claude Desktop already runs the CLI inside a user namespace, so Claude Code's
-  # own bubblewrap sandbox cannot nest another one. The kernel refuses it and
-  # every Bash tool call dies before it runs:
-  #   apply-seccomp: write /proc/self/setgroups (nested userns is
-  #   capability-restricted; caller must provide CAP_SYS_ADMIN): Permission denied
-  # The model retries, then gives up and ends the turn - which looks like replies
-  # stopping half-finished. Drop the inner sandbox; Desktop's outer one stays.
-  mkdir -p "$(dirname "$SETTINGS_JSON")"
-  python3 - "$SETTINGS_JSON" <<'PY'
+# -----------------------------------------------------------------------------
+# A local model sometimes answers "Let me read the plan..." and ends the turn
+# without calling a tool (see claude-stall-guard.py). Registering it as a Stop
+# hook makes Claude Code send that step straight back as an instruction instead
+# of waiting for you to notice nothing happened.
+GUARD_SRC="$(dirname "$(readlink -f "$0")")/claude-stall-guard.py"
+GUARD_PY="$CFG_DIR/claude-stall-guard.py"
+if [ "$STALL_GUARD" -eq 0 ]; then
+  echo "Skipped the stall guard (STALL_GUARD=0 to opt out)."
+elif [ ! -f "$GUARD_SRC" ]; then
+  echo "No $GUARD_SRC beside this script - skipping the stall guard." >&2
+else
+  mkdir -p "$CFG_DIR" "$(dirname "$SETTINGS_JSON")"
+  cp -f "$GUARD_SRC" "$GUARD_PY"
+  chmod +x "$GUARD_PY"
+  python3 - "$SETTINGS_JSON" "$GUARD_PY" <<'PY' || true
 import json, os, shutil, sys
-path = sys.argv[1]
+path, guard = sys.argv[1], sys.argv[2]
+cmd = "python3 %s" % guard
 cfg = {}
 if os.path.exists(path):
     try:
         cfg = json.load(open(path))
     except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
         shutil.copy2(path, path + ".bak")
-        print("existing %s is not valid JSON; backed up to %s.bak" % (path, path))
+        print("existing %s is not a JSON object; backed up to %s.bak and starting fresh" % (path, path))
         cfg = {}
-if not isinstance(cfg, dict):
-    cfg = {}
-sb = cfg.get("sandbox")
-if not isinstance(sb, dict):
-    sb = {}
-    cfg["sandbox"] = sb
-sb["enabled"] = False
+
+def ours(h):                                    # ours, from an earlier run
+    return "claude-stall-guard.py" in str(h.get("command", ""))
+
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+groups = hooks.get("Stop")
+if not isinstance(groups, list):
+    groups = []
+
+kept, removed = [], 0
+for g in groups:
+    if not isinstance(g, dict):
+        kept.append(g)
+        continue
+    inner = g.get("hooks")
+    if isinstance(inner, list) and inner and all(ours(h) for h in inner if isinstance(h, dict)):
+        removed += 1
+        continue
+    if isinstance(inner, list) and any(ours(h) for h in inner if isinstance(h, dict)):
+        g = dict(g, hooks=[h for h in inner if not (isinstance(h, dict) and ours(h))])
+        removed += 1
+    kept.append(g)
+
+kept.append({"hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
+hooks["Stop"] = kept
+cfg["hooks"] = hooks
+
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2)
 if os.path.exists(path):
     os.chmod(tmp, os.stat(path).st_mode & 0o7777)
 os.replace(tmp, path)
-print("Wrote %s -> sandbox.enabled = false" % path)
-print("(Desktop still sandboxes the CLI itself, so commands are not running bare.)")
+print("Wrote %s -> hooks.Stop = stall guard (%d earlier entr%s replaced)"
+      % (path, removed, "y" if removed == 1 else "ies"))
 PY
+  # Self-test: one synthetic transcript that ends in an unfulfilled promise.
+  probe="$(mktemp)"
+  printf '%s\n' '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"Let me read the plan."}]}}' > "$probe"
+  if printf '{"hook_event_name":"Stop","transcript_path":"%s","stop_hook_active":false}' "$probe" \
+       | python3 "$GUARD_PY" | grep -q '"decision": *"block"'; then
+    echo "Stall guard self-test: OK (a stalled turn gets continued once)"
+  else
+    echo "WARNING: stall guard self-test failed - it did not block a known stall." >&2
+  fi
+  rm -f "$probe"
+fi
+
+if [ "$FIX_SANDBOX" -eq 1 ]; then
+  # Every sandboxed shell call dies before it runs:
+  #   apply-seccomp: write /proc/self/setgroups (nested userns is
+  #   capability-restricted; caller must provide CAP_SYS_ADMIN): Permission denied
+  # The model retries, then ends the turn - which looks like replies stopping
+  # half-finished.
+  #
+  # The cause is Ubuntu's AppArmor policy, not Desktop. To satisfy
+  # kernel.apparmor_restrict_unprivileged_userns=1 Ubuntu ships
+  # /etc/apparmor.d/bwrap-userns-restrict, whose unpriv_bwrap child profile is
+  # "audit deny capability": everything inside bwrap starts with CapEff 0, so
+  # Claude Code's apply-seccomp helper cannot create the nested user namespace it
+  # needs for its Unix-socket seccomp filter. Editing ~/.claude/settings.json does
+  # not help a Desktop session - Desktop launches the CLI with --managed-settings
+  # forcing sandbox.enabled=true, which outranks every settings file.
+  FIX_BWRAP=""
+  for cand in "$(dirname "$(readlink -f "$0")")" "$(dirname "$(readlink -f "$0")")/.." "$PWD" "$HOME/.local/bin"; do
+    if [ -f "$cand/fix-claude-bwrap-apparmor.sh" ]; then FIX_BWRAP="$cand/fix-claude-bwrap-apparmor.sh"; break; fi
+  done
+  if [ -z "$FIX_BWRAP" ]; then
+    echo "WARNING: fix-claude-bwrap-apparmor.sh not found next to this script, in its" >&2
+    echo "parent folder, in $PWD or in ~/.local/bin - pull it from claude_setup_strata/." >&2
+  elif [ ! -x "$FIX_BWRAP" ]; then
+    echo "WARNING: $FIX_BWRAP is not executable; run: chmod +x $FIX_BWRAP" >&2
+  elif "$FIX_BWRAP" --check >/dev/null 2>&1; then
+    echo "Sandboxed Bash: OK (nested namespaces inside bwrap work; nothing to do)"
+  else
+    echo "Sandboxed Bash is broken here: Ubuntu denies nested user namespaces inside"
+    echo "bwrap, so Claude Code's seccomp helper fails before your command runs."
+    echo "Repair it once (needs sudo):"
+    echo "    sudo $FIX_BWRAP"
+    echo "Then quit Claude Desktop completely - its running CLI keeps the old"
+    echo "profile - and open a new session. Verify with '$FIX_BWRAP --check', undo"
+    echo "with --revert; --scoped grants userns to a private bwrap copy instead of"
+    echo "/usr/bin/bwrap. See README, Troubleshooting."
+  fi
 else
-  echo "Skipped the Cowork sandbox fix (use --fix-cowork-sandbox if Desktop turns"
-  echo "shell commands into 'apply-seccomp: ... Permission denied')."
+  echo "Skipped the sandboxed-Bash check. If shell commands fail with 'apply-seccomp:"
+  echo "... Permission denied', run --fix-cowork-sandbox (it checks and prints the"
+  echo "repair command; it never touches settings.json)."
 fi
 
 if [ "$WITH_DESKTOP" -eq 1 ]; then
@@ -510,7 +664,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %h/.config/claude-strata/claude-strata-shim.py --port $SHIM_PORT --upstream $(api_root) --models $DESKTOP_MODELS --thinking $SHIM_THINKING
+ExecStart=/usr/bin/python3 %h/.config/claude-strata/claude-strata-shim.py --port $SHIM_PORT --upstream $(api_root) --models $SHIM_MODELS --thinking $SHIM_THINKING --min-max-tokens $SHIM_MIN_MAX_TOKENS
 Restart=on-failure
 RestartSec=2
 
@@ -553,13 +707,18 @@ SHIM_PORT=__SHIM_PORT__
 SHIM_UPSTREAM="__SHIM_UPSTREAM__"
 DESKTOP_MODELS="__DESKTOP_MODELS__"
 SHIM_THINKING="__THINKING__"
+SHIM_MIN_MAX_TOKENS="__MINMAXTOK__"
 SHIM_SERVICE=claude-strata-shim
 DESKTOP_BIN="${CLAUDE_DESKTOP_BIN:-__DESKTOP_BIN__}"
 LOG="$HOME/claude-desktop-strata.log"
 
-# Desktop spawns its own Claude Code and sets only ANTHROPIC_BASE_URL on it, so
-# without this the CLI compacts at its built-in default (~200k) while Strata
-# serves more. Exported here, it inherits through Electron into that CLI.
+# Desktop spawns its own Claude Code, so this inherits through Electron into it.
+# Read the caveat before counting on it: Desktop launches that CLI with
+# --model=<the name in configLibrary>, and Claude Code answers a name that reads as
+# a Claude model from its own table (200k for claude-opus-4-6) without consulting
+# this variable. It only raises the window when that name is one the CLI does not
+# know - which the app's model catalog usually refuses. See README, "Context
+# window".
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-__CTX__}"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
@@ -623,6 +782,7 @@ if ! up "http://localhost:$SHIM_PORT/healthz"; then
     log "No systemd user session - starting the shim via nohup..."
     nohup /usr/bin/python3 "$HOME/.config/claude-strata/claude-strata-shim.py" \
       --port "$SHIM_PORT" --upstream "$SHIM_UPSTREAM" --models "$DESKTOP_MODELS" --thinking "$SHIM_THINKING" \
+      --min-max-tokens "$SHIM_MIN_MAX_TOKENS" \
       >> ~/claude-strata-shim.log 2>&1 &
     shim_pid=$!
   fi
@@ -662,7 +822,7 @@ wait "$child"; rc=$?
 cleanup
 exit $rc
 DESKWRAPPEOF
-  fill "$BIN_DIR/claude-desktop-strata" __SHIM_PORT__ "$SHIM_PORT" __SHIM_UPSTREAM__ "$(api_root)" __DESKTOP_MODELS__ "$DESKTOP_MODELS" __THINKING__ "$SHIM_THINKING" __DESKTOP_BIN__ "$DESKTOP_REAL" __CTX__ "$STRATA_CONTEXT"
+  fill "$BIN_DIR/claude-desktop-strata" __SHIM_PORT__ "$SHIM_PORT" __SHIM_UPSTREAM__ "$(api_root)" __DESKTOP_MODELS__ "$SHIM_MODELS" __THINKING__ "$SHIM_THINKING" __DESKTOP_BIN__ "$DESKTOP_REAL" __CTX__ "$STRATA_CONTEXT" __MINMAXTOK__ "$SHIM_MIN_MAX_TOKENS"
   chmod +x "$BIN_DIR/claude-desktop-strata"
   ln -sfn claude-desktop-strata "$BIN_DIR/claude-desktop"
   echo "Wrote $BIN_DIR/claude-desktop-strata (+ claude-desktop -> it)"
@@ -715,10 +875,11 @@ json.dump(cfg, open(cfg_p, "w"), indent=2)
 print("Wrote", cfg_p, "(deploymentMode: 3p)")
 
 def is_ours(d):
+    # Same marker as --remove: gateway URL + our api key. The label is the user's
+    # to change, so it cannot identify what we wrote.
     return (isinstance(d, dict) and d.get("inferenceProvider") == "gateway"
-            and str(d.get("inferenceGatewayBaseUrl", "")).rstrip("/").endswith("://localhost:%s" % port)
-            and any(isinstance(m, dict) and m.get("labelOverride") == "Strata (local)"
-                    for m in (d.get("inferenceModels") or [{}])))
+            and str(d.get("inferenceGatewayBaseUrl", "")).rstrip("/") == "http://localhost:%s" % port
+            and d.get("inferenceGatewayApiKey") == key)
 
 meta_p = os.path.join(lib, "_meta.json")
 try:
@@ -779,6 +940,8 @@ PY
   fi
   echo "Fully quit Claude Desktop (tray -> Quit) and relaunch it through the app"
   echo "menu or 'claude-desktop'; pick '$DESKTOP_MODEL'."
+  echo "Its agent sessions compact at the window Claude Code has on file for that"
+  echo "name ($DESKTOP_MODEL: 200k), not at the served $STRATA_CONTEXT - see README."
 else
   echo "Skipped Claude Desktop wiring (pass --desktop to configure the 3p gateway)."
 fi

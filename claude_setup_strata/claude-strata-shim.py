@@ -22,13 +22,23 @@ trips over, so this thin proxy exists for that path:
      Strata has no route for (404, and it retries ~20x). The shim answers it
      locally with an estimate (~4 chars/token) so the app stops retrying.
 
-Plus two optional behaviors:
+Plus three optional behaviors:
 
   --thinking off    rewrite `thinking` to {"type":"disabled"}. Strata honors
                     this on its Anthropic surface: no thinking block, so the
-                    first *text* token lands sooner and reasoning tokens stop
-                    eating the max_tokens budget. --thinking keep (default)
-                    passes the app's choice through untouched.
+                    reasoning text no longer lands before (and instead of) the
+                    answer, the first *text* token lands sooner and reasoning
+                    tokens stop eating the max_tokens budget. --thinking keep
+                    (default) passes the app's choice through untouched.
+  --min-max-tokens N
+                    raise a request's `max_tokens` to at least N. Desktop chat
+                    asks for 4096 and Strata keeps a quarter of it for the
+                    answer, so the thinking pass can leave ~1k tokens for the
+                    reply -- or none at all ("the reply reached max tokens while
+                    still thinking, so it has no answer" in the server log),
+                    which is what a mid-sentence stop looks like in the app.
+                    Raising the floor is free: Strata shortens max_tokens to fit
+                    the prompt on its own. 0 (default) leaves requests untouched.
   --normalize       from the older Bionic/LiteLLM chain: merge mid-conversation
                     role=system messages into the top-level system, and strip
                     $schema / propertyNames / string-only anyOf in tool
@@ -39,8 +49,9 @@ Everything else (including SSE) is streamed through byte-for-byte.
 Usage:
   python3 claude-strata-shim.py [--port 4001]
                                [--upstream http://127.0.0.1:47831]
-                               [--models claude-sonnet-4-6,claude-sonnet-4-5]
+                               [--models claude-opus-4-6,claude-sonnet-4-6]
                                [--thinking keep|off]
+                               [--min-max-tokens 16384]
                                [--normalize]
 """
 
@@ -52,9 +63,11 @@ from urllib.parse import urlsplit
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# Desktop names the app's bundled catalog is known to accept (catalog v2831 of
-# app 3.1623.1 includes claude-sonnet-4-6 and claude-sonnet-5).
-DEFAULT_MODELS = ["claude-sonnet-4-6", "claude-sonnet-4-5"]
+# Desktop names the app's bundled catalog is known to accept (verified across
+# catalog v3055 and v3087: both list claude-opus-4-6 and claude-sonnet-4-6 on
+# every surface -- cc, ccd, ccr, chat, cowork). A name outside that list is
+# dropped and the picker comes up empty.
+DEFAULT_MODELS = ["claude-opus-4-6", "claude-sonnet-4-6"]
 
 LABEL = "Strata (local)"
 CHARS_PER_TOKEN = 4.0
@@ -145,6 +158,16 @@ def normalize(body):
     loaded = Upstream.loaded_model()
     if loaded and data.get("model") != loaded:
         data["model"] = loaded
+
+    floor = Handler.min_max_tokens
+    want = data.get("max_tokens")
+    if floor and isinstance(want, int) and not isinstance(want, bool) and want < floor:
+        # Not a size limit so much as a floor under the answer: with the default
+        # answer_room, Strata spends 3/4 of max_tokens on thinking, so a 4096
+        # request leaves ~1024 tokens of reply and the turn stops mid-sentence.
+        data["max_tokens"] = floor
+        sys.stderr.write("[strata-shim] max_tokens %d -> %d (answer needs room)\n"
+                         % (want, floor))
 
     if Handler.thinking_mode == "off":
         # Set it even when the app omitted the param: without an explicit
@@ -239,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
     normalize_enabled = False
     desktop_models = list(DEFAULT_MODELS)
     thinking_mode = "keep"
+    min_max_tokens = 0
     response_started = False
 
     def handle_one_request(self):
@@ -388,6 +412,8 @@ def main():
                              " off = force thinking disabled (faster first text token)")
     parser.add_argument("--normalize", action="store_true",
                         help="also merge mid-conversation system messages and clean tool schemas")
+    parser.add_argument("--min-max-tokens", type=int, default=0, metavar="N",
+                        help="raise any smaller max_tokens up to N (0 = leave requests alone)")
     args = parser.parse_args()
 
     parts = urlsplit(args.upstream)
@@ -396,14 +422,17 @@ def main():
     Upstream.prefix = parts.path.rstrip("/")
     Handler.normalize_enabled = bool(args.normalize)
     Handler.thinking_mode = args.thinking
+    Handler.min_max_tokens = max(0, args.min_max_tokens)
     Handler.desktop_models = [m.strip() for m in args.models.split(",") if m.strip()]
 
     loaded = Upstream.loaded_model()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     sys.stderr.write(
-        "[strata-shim] http://127.0.0.1:%d -> %s%s (model=%s, desktop names=%s, thinking=%s, normalize=%s)\n"
+        "[strata-shim] http://127.0.0.1:%d -> %s%s (model=%s, desktop names=%s, thinking=%s, "
+        "min max_tokens=%d, normalize=%s)\n"
         % (args.port, args.upstream, Upstream.prefix, loaded or "unknown",
-           ",".join(Handler.desktop_models), Handler.thinking_mode, Handler.normalize_enabled)
+           ",".join(Handler.desktop_models), Handler.thinking_mode, Handler.min_max_tokens,
+           Handler.normalize_enabled)
     )
     server.serve_forever()
 

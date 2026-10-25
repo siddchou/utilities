@@ -76,7 +76,9 @@ STRATA_URL=http://127.0.0.1:8080 STRATA_MODEL=qwen3-coder STRATA_CONTEXT=131072 
 | `STRATA_MAX_OUTPUT_TOKENS` | `4096` | thinking tokens count toward this |
 | `SHIM_PORT` | `4001` | Desktop shim |
 | `SHIM_THINKING` | `keep` | `off` forces `thinking: {"type":"disabled"}` on Desktop requests: no thinking block, so reasoning stops eating the `max_tokens` budget and the answer starts as text. `keep` passes the app's choice through |
-| `DESKTOP_MODEL` | `claude-sonnet-4-6` | must exist in Desktop's bundled catalog |
+| `SHIM_MIN_MAX_TOKENS` | `16384` | output-token floor for Desktop requests. The app asks for 4096 and Strata keeps a quarter of that for the answer, so thinking can leave ~1k tokens for the reply — or none. `0` leaves the app's value alone |
+| `DESKTOP_MODEL` | `claude-opus-4-6` | must exist in Desktop's bundled catalog |
+| `STALL_GUARD` | `1` | `0` skips the Stop hook that continues a turn the model abandoned (see Troubleshooting) |
 
 ## Usage
 
@@ -123,13 +125,32 @@ Launching through the wrapper, `~/.config/Claude-3p/logs/main.log` shows:
 [custom-3p] inference apiHost=http://localhost:4001/
 ```
 
-`claude-sonnet-4-6` **is** in catalog v2831 (ids include `claude-sonnet-5`,
-`claude-opus-4-6`…`4-8`, `claude-haiku-5-5`), so the default name works as-is.
-Decoding your own catalog is the way to check after an app update:
+`claude-opus-4-6` **is** in the catalog this build ships — it moves with every app
+update (v3055 when this was written, v3087 the next morning), and it lists
+`claude-opus-4-6` plus `claude-sonnet-4-6` on every surface: `cc`, `ccd`, `ccr`,
+`chat`, `cowork`. Decoding your own catalog is the way to check after an update:
 
 ```bash
-python3 -c 'import json,base64;d=json.load(open("%s/.config/Claude-3p/model-catalog/published.json"%__import__("os").environ["HOME"]));print(base64.b64decode(d["documentBytes"]).decode()[:200])'
+python3 - <<'PY'
+import json, base64, os
+d = json.load(open(os.path.expanduser("~/.config/Claude-3p/model-catalog/published.json")))
+doc = json.loads(base64.b64decode(d["documentBytes"]).decode())
+def ids(o, acc):
+    if isinstance(o, dict):
+        if isinstance(o.get("id"), str) and o["id"].startswith("claude-"): acc.append(o["id"])
+        [ids(v, acc) for v in o.values()]
+    elif isinstance(o, list):
+        [ids(v, acc) for v in o]
+for name, s in (doc.get("surfaces") or {}).items():
+    acc = []; ids(s.get("model_selector_config"), acc)
+    print(name, sorted(set(acc)))
+PY
 ```
+
+`DESKTOP_MODEL` must appear in that list for the surface you use. A name that is
+not in it is dropped in silence: `ConfigHealth` still reports `healthy`, but the
+launch line reads `picker = 0 (empty)` instead of `picker = 1 (inferenceModels)`,
+and the app has no model to chat with.
 
 Note that Desktop does **not** use the `claude` on your PATH for chat: it
 downloads and spawns its own CLI (`~/.config/Claude-3p/claude-code/<ver>/…/claude`)
@@ -163,7 +184,7 @@ What `--desktop` writes:
   `http://localhost:4001/`, and the matching `_meta.json` `appliedId`
 
 Then fully quit Claude Desktop (tray → Quit), relaunch from the app menu or
-`claude-desktop`, and pick **claude-sonnet-4-6** — that's Strata answering.
+`claude-desktop`, and pick **claude-opus-4-6** — that's Strata answering.
 
 If your Desktop build rejects that name, decode the base64 `documentBytes` in
 `~/.config/Claude-3p/model-catalog/published.json` and look under
@@ -172,6 +193,22 @@ If your Desktop build rejects that name, decode the base64 `documentBytes` in
 
 The mode is undocumented (see https://github.com/mohitsoni48/Claude-Desktop-Router);
 a future app update may change or remove it.
+
+## Context window
+
+Two different windows are in play, and they are set in different places:
+
+| Path | Model name it sends | Window Claude Code uses |
+| --- | --- | --- |
+| `claude-strata` (and `--write-settings`) | the Strata id, e.g. `unsloth-ud-q4_k_xl` | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — the served 262144 here |
+| Claude Desktop agent sessions | `DESKTOP_MODEL`, a catalog name | Claude Code's **own** table for that name (200k) |
+
+Claude Code only consults `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for a name it does not
+recognise; a name that reads as an Anthropic model wins over it. That is why
+`--write-settings` keeps the Strata id in `~/.claude/settings.json` (full window,
+and the shim rewrites `model` on the way through anyway) while Desktop's
+`configLibrary` row *must* keep a catalog name — and why its sessions compact at
+200k even though Strata serves more. Nothing breaks; the turns just compact sooner.
 
 ## Manage
 
@@ -185,6 +222,8 @@ sudo ./fix-claude-bwrap-apparmor.sh                         # fix it if not (--r
 systemctl --user status claude-strata-shim                  # shim health
 journalctl --user -u claude-strata-shim -f                  # shim logs
 curl -s localhost:4001/healthz                              # {"status":"ok","model":"..."}
+journalctl --user -u claude-strata-shim -f | grep max_tokens  # replies getting room to finish
+STALL_GUARD=0 ./setup-claude-strata.sh --desktop             # without the Stop hook
 strata status                                               # Strata's own telemetry
 strata connect claude-code --url http://127.0.0.1:47831 --check   # vendor's own prompt+tool check
 ```
@@ -258,10 +297,42 @@ strata connect claude-code --url http://127.0.0.1:47831 --check   # vendor's own
   still gets a fallback title). `SHIM_THINKING=off ./setup-claude-strata.sh
   --desktop` removes the thinking pass from Desktop requests, which cuts the
   latency and the token burn; it does not affect `claude-strata`.
+- **The reply is one sentence — "Let me read the plan…" — and then nothing** — the
+  model announced a step and ended the turn (`stop_reason: end_turn`, no
+  `tool_use` block), so the CLI waits for you instead of acting. Nothing is
+  broken: the same request replayed usually *does* call the tool. Measured on this
+  box with the real 116-tool/47 KB request from a stalled session: 5 replays, 4
+  called `Read`, 1 stalled exactly like that. It is the local model, and what
+  fixes it is `claude-stall-guard.py`, a Stop hook the setup registers in
+  `~/.claude/settings.json`. When a turn ends on an unfulfilled promise it returns
+  `{"decision":"block","reason":"…make the tool call you just described"}`, which
+  makes Claude Code continue instead of stopping. Over 690 replies in your real
+  sessions it fires on 3 — all three genuine stalls — and `stop_hook_active`
+  caps it at one nudge per turn, so it can never loop. Confirm it is running from
+  a session transcript: `"subtype":"stop_hook_summary" … "hookCount":1` (3 inside
+  Desktop, which adds its own two callbacks). `STALL_GUARD=0` opts out.
+- **Desktop chat: replies stop mid-sentence** — same cause, different knob. The
+  app sends `max_tokens: 4096` and Strata's answer-room rule spends three quarters
+  of it on thinking, so the reply gets ~1k tokens: the server log reads
+  `thinking limited to 3072 of max_tokens 4096 so the answer has room` and the turn
+  ends `(length)` instead of `(stop)`. Worst case it ends `the reply reached max
+  tokens while still thinking, so it has no answer` — an empty bubble. The shim
+  raises the floor (`SHIM_MIN_MAX_TOKENS`, 16384 by default); watch it with
+  `journalctl --user -u claude-strata-shim -f | grep max_tokens`. It costs nothing:
+  Strata shortens `max_tokens` to fit the prompt on its own anyway.
 - **Desktop: "Gateway /v1/models returned an unexpected body"** — Desktop is
   hitting Strata directly instead of the shim (`inferenceGatewayBaseUrl` must be
   `http://localhost:4001/`), or the shim is down: `systemctl --user restart claude-strata-shim`.
 - **Desktop: `config_model_rejected`** — see the catalog-name note above.
+- **Desktop: the model picker is empty and no chat starts** — the name in
+  `~/.config/Claude-3p/configLibrary/<id>.json` under `inferenceModels[].name` is
+  not one the app's catalog offers (hand-editing it to a Strata id does it: the
+  *shim* maps names to the loaded model, the *app* never sees that step). Confirm
+  with `grep 'picker = ' ~/.config/Claude-3p/logs/main.log` — the newest launch
+  reads `picker = 0 (empty)` instead of `picker = 1 (inferenceModels)`, and note
+  that `ConfigHealth` keeps reporting `healthy`, so nothing else looks wrong.
+  Fix: `DESKTOP_MODEL=<a catalog name> ./setup-claude-strata.sh --desktop`, then
+  quit and relaunch Desktop.
 
 ## Differences from the Bionic setup
 
